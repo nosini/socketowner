@@ -1,0 +1,19 @@
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	0000000000000000
+CapAmb:	0000000000000000
+custom setsockopt OK
+SO_MARK ERROR 1 [Errno 1] Operation not permitted
+[{
+        "key": 0,
+        "value": 305419896
+    }
+]
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	0000000000000000
+CapAmb:	0000000000000000
+custom setsockopt ERROR 92 [Errno 92] Protocol not available
+SO_MARK ERROR 1 [Errno 1] Operation not permitted

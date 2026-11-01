@@ -1,0 +1,28 @@
+wine-trace.58126:1: execve("/home/agent/work/run-in-sandbox/dwproton-15/install/bin/wine", ["/home/agent/work/run-in-sandbox/dwproton-15/install/bin/wine", "./winsock-probe.exe.so"], 0x7ffc8358fa30 /* 65 vars */) = 0
+wine-trace.58126:2: execve("/home/agent/work/run-in-sandbox/dwproton-15/install/lib/wine/i386-unix/wine-preloader", ["/home/agent/work/run-in-sandbox/dwproton-15/install/lib/wine/i386-unix/wine-preloader", "/home/agent/work/run-in-sandbox/dwproton-15/install/lib/wine/i386-unix/wine", "./winsock-probe.exe.so"], 0xee73290 /* 66 vars */) = -1 ENOENT (No such file or directory)
+wine-trace.58126:3: execve("/home/agent/work/run-in-sandbox/dwproton-15/install/lib/wine/i386-unix/wine", ["/home/agent/work/run-in-sandbox/dwproton-15/install/lib/wine/i386-unix/wine", "./winsock-probe.exe.so"], 0xee73290 /* 66 vars */) = -1 ENOENT (No such file or directory)
+wine-trace.58126:4: execve("/home/agent/work/run-in-sandbox/dwproton-15/install/lib/wine/x86_64-unix/wine-preloader", ["/home/agent/work/run-in-sandbox/dwproton-15/install/lib/wine/x86_64-unix/wine-preloader", "/home/agent/work/run-in-sandbox/dwproton-15/install/lib/wine/x86_64-unix/wine", "./winsock-probe.exe.so"], 0xee73290 /* 66 vars */) = 0
+wine-trace.58126:57: sendmsg(15, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="tcp-sync", iov_len=8}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 8
+wine-trace.58126:60: recvmsg(15, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="tcp-sync", iov_len=64}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 8
+wine-trace.58126:63: sendmsg(15, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="tcp-async", iov_len=9}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 9
+wine-trace.58126:66: recvmsg(15, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="tcp-async", iov_len=64}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 9
+wine-trace.58126:72: recvmsg(15, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="connectex-data", iov_len=64}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 14
+wine-trace.58126:76: sendmsg(15, {msg_name={sa_family=AF_INET, sin_port=htons(30553), sin_addr=inet_addr("127.0.0.1")}, msg_namelen=16, msg_iov=[{iov_base="udp-sendto", iov_len=10}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 10
+wine-trace.58126:78: recvmsg(15, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="udp-sendto", iov_len=64}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 10
+wine-trace.58126:81: sendmsg(15, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="udp-connected", iov_len=13}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 13
+wine-trace.58126:83: recvmsg(15, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="udp-connected", iov_len=64}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 13
+wine-trace.58127:1: execve("/home/agent/work/run-in-sandbox/dwproton-15/install/lib/wine/../../bin/wineserver", ["/home/agent/work/run-in-sandbox/dwproton-15/install/lib/wine/../../bin/wineserver"], 0x7ffc721be3a0 /* 65 vars */) = 0
+wine-trace.58128:336: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 32
+wine-trace.58128:342: connect(32, {sa_family=AF_INET, sin_port=htons(30443), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+wine-trace.58128:343: getsockname(32, {sa_family=AF_INET, sin_port=htons(51786), sin_addr=inet_addr("127.0.0.1")}, [112 => 16]) = 0
+wine-trace.58128:350: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 32
+wine-trace.58128:356: bind(32, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+wine-trace.58128:357: getsockname(32, {sa_family=AF_INET, sin_port=htons(45863), sin_addr=inet_addr("127.0.0.1")}, [112 => 16]) = 0
+wine-trace.58128:359: connect(32, {sa_family=AF_INET, sin_port=htons(30443), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+wine-trace.58128:360: getsockname(32, {sa_family=AF_INET, sin_port=htons(45863), sin_addr=inet_addr("127.0.0.1")}, [112 => 16]) = 0
+wine-trace.58128:361: sendto(32, "connectex-data", 14, 0, NULL, 0) = 14
+wine-trace.58128:366: socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) = 32
+wine-trace.58128:371: bind(32, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("0.0.0.0")}, 16) = 0
+wine-trace.58128:372: getsockname(32, {sa_family=AF_INET, sin_port=htons(45392), sin_addr=inet_addr("0.0.0.0")}, [16]) = 0
+wine-trace.58128:373: connect(32, {sa_family=AF_INET, sin_port=htons(30553), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+wine-trace.58128:374: getsockname(32, {sa_family=AF_INET, sin_port=htons(45392), sin_addr=inet_addr("127.0.0.1")}, [112 => 16]) = 0

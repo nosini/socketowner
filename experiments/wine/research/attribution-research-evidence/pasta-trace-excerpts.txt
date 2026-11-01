@@ -1,0 +1,20 @@
+211: 57621 bind(4, {sa_family=AF_INET, sin_port=htons(41234), sin_addr=inet_addr("0.0.0.0")}, 16) = 0
+212: 57621 connect(4, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.1.1.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+215: 57620 connect(17, 0x7ffe1565d7f0, 16)   = -1 EINPROGRESS (Operation now in progress)
+221: 57621 getsockname(4, {sa_family=AF_INET, sin_port=htons(41234), sin_addr=inet_addr("10.0.13.254")}, [16]) = 0
+227: 57621 bind(5, {sa_family=AF_INET, sin_port=htons(58830), sin_addr=inet_addr("0.0.0.0")}, 16) = 0
+228: 57621 connect(5, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.1.1.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+231: 57620 connect(18, 0x7ffe1565d7f0, 16)   = -1 EINPROGRESS (Operation now in progress)
+237: 57621 getsockname(5, {sa_family=AF_INET, sin_port=htons(58830), sin_addr=inet_addr("10.0.13.254")}, [16]) = 0
+241: 57621 bind(6, {sa_family=AF_INET, sin_port=htons(41234), sin_addr=inet_addr("0.0.0.0")}, 16) = 0
+242: 57621 connect(6, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("1.1.1.1")}, 16) = 0
+255: 57621 recvfrom(6, "\0224\201\200\0\1\0\2\0\0\0\0\7example\3com\0\0\1\0\1\300\f\0\1\0\1\0\0\0\270\0\4h\24\27\232\300\f\0\1\0\1\0\0\0\270\0\4\254B\223\363", 4096, 0, NULL, NULL) = 61
+256: 57621 getsockname(6, {sa_family=AF_INET, sin_port=htons(41234), sin_addr=inet_addr("10.0.13.254")}, [16]) = 0
+258: 57621 bind(7, {sa_family=AF_INET, sin_port=htons(58830), sin_addr=inet_addr("0.0.0.0")}, 16) = 0
+259: 57621 connect(7, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("1.1.1.1")}, 16) = 0
+272: 57621 recvfrom(7, "\0224\201\200\0\1\0\2\0\0\0\0\7example\3com\0\0\1\0\1\300\f\0\1\0\1\0\0\0\270\0\4\254B\223\363\300\f\0\1\0\1\0\0\0\270\0\4h\24\27\232", 4096, 0, NULL, NULL) = 61
+273: 57621 getsockname(7, {sa_family=AF_INET, sin_port=htons(58830), sin_addr=inet_addr("10.0.13.254")}, [16]) = 0
+298: 57621 getsockname(6, {sa_family=AF_INET, sin_port=htons(41234), sin_addr=inet_addr("10.0.13.254")}, [16]) = 0
+300: 57621 getsockname(5, {sa_family=AF_INET, sin_port=htons(58830), sin_addr=inet_addr("10.0.13.254")}, [16]) = 0
+302: 57621 getsockname(4, {sa_family=AF_INET, sin_port=htons(41234), sin_addr=inet_addr("10.0.13.254")}, [16]) = 0
+309: 57621 getsockname(7 <unfinished ...>

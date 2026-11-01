@@ -1,0 +1,3 @@
+alpha.exe: Windows PID 116; 3 creations, 3 connects, 5 sends; Windows identity matches probe output; unconnected UDP labelled before connect; ConnectEx server send retains identity.
+beta.exe: Windows PID 124; 3 creations, 3 connects, 5 sends; Windows identity matches probe output; unconnected UDP labelled before connect; ConnectEx server send retains identity.
+PASS: 22 observations, two Windows images, one wineserver.

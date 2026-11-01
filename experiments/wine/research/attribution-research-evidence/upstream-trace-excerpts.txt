@@ -1,0 +1,27 @@
+upstream-trace.58290:1: execve("/usr/bin/wine", ["/usr/bin/wine", "./winsock-probe.exe.so"], 0x7ffe3cf07070 /* 65 vars */) = 0
+upstream-trace.58290:2: execve("/usr/lib64/wine/i386-unix/wine-preloader", ["/usr/lib64/wine/i386-unix/wine-preloader", "/usr/lib64/wine/i386-unix/wine", "./winsock-probe.exe.so"], 0x55912dc510b0 /* 66 vars */) = 0
+upstream-trace.58292:1: execve("/usr/lib/wine/../../bin/wineserver", ["/usr/lib/wine/../../bin/wineserver"], 0xffc443c0 /* 65 vars */) = 0
+upstream-trace.58293:5964: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 303
+upstream-trace.58293:5970: connect(303, {sa_family=AF_INET, sin_port=htons(30443), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+upstream-trace.58293:5971: getsockname(303, {sa_family=AF_INET, sin_port=htons(42276), sin_addr=inet_addr("127.0.0.1")}, [28 => 16]) = 0
+upstream-trace.58293:5976: socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 303
+upstream-trace.58293:5982: bind(303, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+upstream-trace.58293:5983: getsockname(303, {sa_family=AF_INET, sin_port=htons(34425), sin_addr=inet_addr("127.0.0.1")}, [28 => 16]) = 0
+upstream-trace.58293:5985: connect(303, {sa_family=AF_INET, sin_port=htons(30443), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+upstream-trace.58293:5986: getsockname(303, {sa_family=AF_INET, sin_port=htons(34425), sin_addr=inet_addr("127.0.0.1")}, [28 => 16]) = 0
+upstream-trace.58293:5987: sendto(303, "connectex-data", 14, 0, NULL, 0) = 14
+upstream-trace.58293:5991: socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) = 303
+upstream-trace.58293:5996: bind(303, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("0.0.0.0")}, 16) = 0
+upstream-trace.58293:5997: getsockname(303, {sa_family=AF_INET, sin_port=htons(60255), sin_addr=inet_addr("0.0.0.0")}, [16]) = 0
+upstream-trace.58293:5998: connect(303, {sa_family=AF_INET, sin_port=htons(30553), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+upstream-trace.58293:5999: getsockname(303, {sa_family=AF_INET, sin_port=htons(60255), sin_addr=inet_addr("127.0.0.1")}, [28 => 16]) = 0
+upstream-trace.58567:1: execve("/usr/lib/wine/x86_64-unix/wine-preloader", ["/usr/lib/wine/x86_64-unix/wine-preloader", "/usr/lib/wine/x86_64-unix/wine", "Z:\\home\\agent\\work\\run-in-sandbox\\attribution-research-20261028\\winsock-probe.exe.so"], 0x7e6d3910 /* 68 vars */) = 0
+upstream-trace.58567:29: sendmsg(10, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="tcp-sync", iov_len=8}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 8
+upstream-trace.58567:31: recvmsg(10, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="tcp-sync", iov_len=64}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 8
+upstream-trace.58567:34: sendmsg(10, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="tcp-async", iov_len=9}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 9
+upstream-trace.58567:36: recvmsg(10, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="tcp-async", iov_len=64}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 9
+upstream-trace.58567:41: recvmsg(10, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="connectex-data", iov_len=64}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 14
+upstream-trace.58567:45: sendmsg(10, {msg_name={sa_family=AF_INET, sin_port=htons(30553), sin_addr=inet_addr("127.0.0.1")}, msg_namelen=16, msg_iov=[{iov_base="udp-sendto", iov_len=10}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 10
+upstream-trace.58567:47: recvmsg(10, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="udp-sendto", iov_len=64}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 10
+upstream-trace.58567:50: sendmsg(10, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="udp-connected", iov_len=13}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 13
+upstream-trace.58567:52: recvmsg(10, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="udp-connected", iov_len=64}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 13

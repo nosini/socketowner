@@ -1,0 +1,4 @@
+{"kind": 1, "inner": ["10.0.13.254", 41234], "dest": ["1.1.1.1", 443], "result": "connected"}
+{"kind": 1, "inner": ["10.0.13.254", 58830], "dest": ["1.1.1.1", 443], "result": "connected"}
+{"kind": 2, "inner": ["10.0.13.254", 41234], "dest": ["1.1.1.1", 53], "result": "DNS reply bytes=61"}
+{"kind": 2, "inner": ["10.0.13.254", 58830], "dest": ["1.1.1.1", 53], "result": "DNS reply bytes=61"}

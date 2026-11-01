@@ -1,0 +1,4 @@
+udp   ESTAB      0      0             10.0.13.254:58830        1.1.1.1:53    users:(("pasta.avx2",pid=57620,fd=91)) uid:1000 ino:130998 sk:2004 cgroup:/user.slice/user-1000.slice/session-35.scope <->
+udp   ESTAB      0      0             10.0.13.254:41234        1.1.1.1:53    users:(("pasta.avx2",pid=57620,fd=90)) uid:1000 ino:130996 sk:2005 cgroup:/user.slice/user-1000.slice/session-35.scope <->
+tcp   ESTAB      0      0             10.0.13.254:37386        1.1.1.1:443   users:(("pasta.avx2",pid=57620,fd=17)) uid:1000 ino:130920 sk:2006 cgroup:/user.slice/user-1000.slice/session-35.scope <->
+tcp   ESTAB      0      0             10.0.13.254:37402        1.1.1.1:443   users:(("pasta.avx2",pid=57620,fd=18)) uid:1000 ino:130921 sk:2007 cgroup:/user.slice/user-1000.slice/session-35.scope <->

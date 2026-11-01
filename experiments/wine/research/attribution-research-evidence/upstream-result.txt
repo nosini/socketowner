@@ -1,0 +1,9 @@
+Windows PID=412
+TCP connect=0
+TCP recv=8
+WSASend=0 error=0
+WSARecv=-1 error=997
+WSARecv bytes=9
+ConnectEx=0 error=997
+ConnectEx recv=14
+UDP connect=0
