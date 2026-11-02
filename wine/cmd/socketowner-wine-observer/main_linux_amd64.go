@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/nosini/socketowner/experiments/wine"
+	"github.com/nosini/socketowner/wine"
 )
 
 func run() error {

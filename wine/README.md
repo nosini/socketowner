@@ -10,7 +10,9 @@ capability, and no per-build profile. It is told nothing about Wine: wineservers
 and their pastas are found as they appear, so it only has to be running before a
 game starts.
 
-This remains an experiment; see [what is missing](#what-is-missing). It leaves
+The observer is an optional feature available on `main`. It has been validated
+with real Wine clients, pasta and mihomo, including its confined systemd service;
+see [validation](#validation) and [known limitations](#known-limitations). It leaves
 native socketowner maps unchanged. Do not use the diagnostic event stream as a
 routing authority: readers use the pinned [routing maps](#routing-maps).
 
@@ -20,7 +22,7 @@ The ordinary socketowner command and its installation are unchanged. Build this
 command explicitly, on Linux amd64:
 
 ```sh
-CGO_ENABLED=0 go build -o socketowner-wine-observer ./experiments/wine/cmd/socketowner-wine-observer
+CGO_ENABLED=0 go build -o socketowner-wine-observer ./wine/cmd/socketowner-wine-observer
 sudo ./socketowner-wine-observer -pin /sys/fs/bpf/mihomo/maps -reader-group mihomo
 ```
 
@@ -218,7 +220,7 @@ Regenerate the embedded object after a BPF change using clang/llvm and libbpf
 headers, then rebuild:
 
 ```sh
-go generate ./experiments/wine
+go generate ./wine
 go test ./...
 ```
 
@@ -226,9 +228,9 @@ Privileged tests belong in the dedicated test VM, and run as the ordinary user;
 only the observer, mihomo and test firewall rules use sudo:
 
 ```sh
-python3 experiments/wine/testdata/real-wine.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --work /absolute/task/real-wine
-python3 experiments/wine/testdata/pasta-route.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/route
-python3 experiments/wine/testdata/sandbox-route.py --sandbox /path/to/run-in-sandbox --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/sandbox
+python3 wine/testdata/real-wine.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --work /absolute/task/real-wine
+python3 wine/testdata/pasta-route.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/route
+python3 wine/testdata/sandbox-route.py --sandbox /path/to/run-in-sandbox --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/sandbox
 ```
 
 `pasta-route.py --control` repeats its run without the relay, where no rule may see
@@ -237,11 +239,8 @@ exercise the installed systemd observer (restarts it and leaves it running),
 including its SELinux domain and shared routing maps. Probes need Wine's
 `winegcc` or mingw.
 
-## What is missing
+## Known limitations
 
-- **Deployment.** The service and separate observer domain are in
-  hardened-proxy-service. Install its updated policy, unit and observer binary
-  together; see its Wine process attribution instructions.
 - **Removed tests.** The fixture VM tests modelled wineserver's memory, which is no
   longer read. Exec revocation, nested PID namespaces with no capabilities, FD reuse
   and failed connects on the new capture have only incidental coverage.

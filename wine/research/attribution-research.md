@@ -302,7 +302,7 @@ The corrected recommendation is to investigate this **host-only Wine adapter bef
 ## Implementation milestone: host-only Wine observer
 
 The follow-up is now implemented on branch `wine-process-attribution`, under
-`experiments/wine/`. The [observer README](../README.md) has build/use
+`wine/`. The [observer README](../README.md) has build/use
 instructions; [validation](../validation/README.md) and raw logs record the checks. This remains
 a separate diagnostic command, with no deployment or native map ABI change.
 

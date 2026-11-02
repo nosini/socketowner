@@ -4,7 +4,7 @@
 
 The `wine-process-attribution` implementation was tested without installing a
 service or changing the desktop. These are diagnostic results. Source and reproduction commands are in the
-[experiment README](../README.md).
+[observer README](../README.md).
 Later [routing validation](routing/README.md) covers mihomo and pasta.
 The [earlier research evidence](../research/README.md) records separate
 proof-of-concept runs; its observations are not results from this implementation.
@@ -15,7 +15,7 @@ container. The embedded BPF object was compiled from `../bpf/wine.c` in the VM
 and stripped of DWARF, retaining BTF/CO-RE metadata. Its SHA-256 is
 `16849d4b779e8218fd79161cd95bf62d8ea1e8746d7484f943043674d611cab6`.
 
-Local checks passed: `go test ./...`, `go test -race ./experiments/wine/...`
+Local checks passed: `go test ./...`, `go test -race ./wine/...`
 and `go vet ./...`. The separate command and the `wine_vm` tagged test binary
 also built successfully. No native map format or mihomo code changed.
 
@@ -50,8 +50,9 @@ the independently expected Windows PIDs in [alpha](alpha-stdout.log) and
 The runner was the existing DW 11.0-15-based VM build, using Wine socket source
 `b75a4125963073b01d2b3bfce6060d697d02066b` with existing local display patches
 through `a451b29d1ca0baf2da86d3cdf0b9bffdc9752226`. It was not rebuilt or patched
-for attribution. The exact wineserver hash and layout are in the
-[profile](../profiles/wineserver-3bb468ca4d60c890.json).
+for attribution. The wineserver hash and layout were recorded in
+`wineserver-3bb468ca4d60c890.json`, removed when profile-free capture replaced
+that design.
 
 Two sequential Winelib clients, `alpha.exe` (Windows PID 32) and `beta.exe`
 (Windows PID 252), used the same wineserver. Each created three sockets:

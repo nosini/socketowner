@@ -63,10 +63,12 @@ executable. A loader update takes effect when its service is restarted.
 
 See [development](docs/development.md) for source builds and tests.
 
-An optional [Wine observer experiment](experiments/wine/README.md) identifies
+An optional [Wine observer](wine/README.md) identifies
 Windows socket creators in unchanged Wine, needing no per-build data. It is a
 separate command, which can also publish them for mihomo through a sandbox's
-pasta. It is started by hand and has no service integration.
+pasta. Run it continuously using the optional Wine observer unit in
+[hardened-proxy-service](https://github.com/nosini/hardened-proxy-service/tree/ebpf-process-lookup),
+or start it by hand before launching games.
 
 ## License
 
