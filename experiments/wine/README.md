@@ -261,6 +261,9 @@ python3 experiments/wine/testdata/pasta-route.py --runner /path/to/runner/bin --
 
 `--control` repeats it without the relay, where no rule may see a Windows name.
 
+`testdata/sandbox-route.py` does the same inside real `sandbox-game --net`, with
+`--pe` for native PE probes; see its [results](validation/sandbox/README.md).
+
 A separate real-Wine smoke test runs as the ordinary VM user. Only its observer
 uses sudo. It requires the existing Wine runner's compiler and writes only to
 the supplied task directory:
@@ -281,11 +284,14 @@ The tested real runner was an unchanged existing DW 11.0-15-based build.
 
 - **Launch integration.** The observer needs the wineserver and pasta PIDs, and
   must be ready before the program's first socket. Nothing automates that yet,
-  and an earlier socket stays unlabelled.
+  and an earlier socket stays unlabelled. A root observer can't be asked from
+  inside a sandbox, and a real launch has no pause for it to attach.
+- **Packaged runners.** Those without DWARF, such as packaged DW releases, can't
+  generate a profile yet; see the [sandbox validation](validation/sandbox/README.md).
 - **Several sandboxes.** One observer serves one wineserver and one pasta, and
   one publisher may use a pin directory. A second sandbox is refused.
 - **Deployment.** No service unit, SELinux policy or reader-group setup exists.
-- **Untested:** NIKKE, real Wine in bwrap/run-in-sandbox, native PE/WOW64, IPv6
+- **Untested:** NIKKE, 32-bit PE through WOW64, Proton's launch script, IPv6
   through the relay, UDP through a mihomo inbound (only its published record was
   checked), other DW builds, and load. The per-packet cost of `wine_egress`,
   which now parses every packet on the host, has not been measured.
