@@ -236,14 +236,14 @@ a Windows name. `sandbox-route.py --bits 32` uses 32-bit probes. Probes need Win
 ## What is missing
 
 - **Deployment.** No service unit, SELinux policy or reader-group setup exists.
+  mihomo's policy only reads maps created by `socketowner_t`, so the observer needs
+  that domain or a matching rule.
   mihomo's service must also run this observer before games start.
 - **Removed tests.** The fixture VM tests modelled wineserver's memory, which is no
   longer read. Exec revocation, nested PID namespaces with no capabilities, FD reuse
   and failed connects on the new capture have only incidental coverage.
-- **Untested:** the game itself past its launcher, whether routing by name works
-  on the desktop, new-style WOW64, IPv6 through the relay, UDP through a mihomo inbound (only its
-  published record was checked), and load. The per-packet cost of `wine_egress`,
-  which parses every packet on the host, has not been measured.
+- **Untested:** new-style WOW64, IPv6 through the relay, and load. The per-packet
+  cost of `wine_egress`, which parses every packet on the host, has not been measured.
 - **A multi-threaded wineserver** would break step 2 of capture. None exists among
   the tested runners; the design has no detection for one yet.
 - **DNS.** Flows sent to pasta's `--dns-forward` address are translated, so they
