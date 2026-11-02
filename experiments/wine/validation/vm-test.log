@@ -1,0 +1,11 @@
+=== RUN   TestWineObserverVM
+=== RUN   TestWineObserverVM/pidns=false
+=== RUN   TestWineObserverVM/pidns=true
+=== RUN   TestWineObserverVM/restart-does-not-adopt-existing-socket
+=== RUN   TestWineObserverVM/exec-revokes
+--- PASS: TestWineObserverVM (1.63s)
+    --- PASS: TestWineObserverVM/pidns=false (0.37s)
+    --- PASS: TestWineObserverVM/pidns=true (0.37s)
+    --- PASS: TestWineObserverVM/restart-does-not-adopt-existing-socket (0.62s)
+    --- PASS: TestWineObserverVM/exec-revokes (0.26s)
+PASS

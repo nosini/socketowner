@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "id": "wineserver-3bb468ca4d60c890",
+  "sha256": "3bb468ca4d60c89074c6d854af871931f963586ac5915cca964e488b21422186",
+  "architecture": "amd64",
+  "elf_type": "EXEC",
+  "current_symbol": 4897696,
+  "offsets": {
+    "thread_process": 136,
+    "process_id": 152,
+    "process_unix_pid": 188,
+    "process_start_time": 208,
+    "process_image_length": 252,
+    "process_image": 256
+  }
+}

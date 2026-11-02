@@ -63,6 +63,11 @@ executable. A loader update takes effect when its service is restarted.
 
 See [development](docs/development.md) for source builds and tests.
 
+An optional [Wine observer experiment](experiments/wine/README.md) identifies
+Windows socket creators from an unchanged, verified wineserver build. It is a
+separate diagnostic command; it does not yet connect Wine identities to mihomo
+rules or pasta's host sockets.
+
 ## License
 
 [GNU GPL v3](LICENSE). The BPF object files retain the same license as their
