@@ -34,8 +34,10 @@ next publisher.
 The observer needs host BPF/LSM and cgroup attachment privileges, and permission
 to inspect other processes' file descriptors to find pasta, so `CAP_SYS_PTRACE`
 in addition to `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`. Root in the test VM
-supplies these rights. No service or SELinux policy change is included. Wine and
-games remain unprivileged.
+supplies these rights. The optional service and SELinux policy live in
+[hardened-proxy-service](https://github.com/nosini/hardened-proxy-service), not in
+this repository. The command sends systemd readiness after publishing its maps
+when `NOTIFY_SOCKET` is set. Wine and games remain unprivileged.
 
 A wineserver which predates the observer is picked up at its next request, but
 sockets it already created stay unlabelled.
@@ -230,20 +232,21 @@ python3 experiments/wine/testdata/sandbox-route.py --sandbox /path/to/run-in-san
 ```
 
 `pasta-route.py --control` repeats its run without the relay, where no rule may see
-a Windows name. `sandbox-route.py --bits 32` uses 32-bit probes. Probes need Wine's
+a Windows name. `sandbox-route.py --bits 32` uses 32-bit probes. Add `--observer-service` to
+exercise the installed systemd observer (restarts it and leaves it running),
+including its SELinux domain and shared routing maps. Probes need Wine's
 `winegcc` or mingw.
 
 ## What is missing
 
-- **Deployment.** No service unit, SELinux policy or reader-group setup exists.
-  mihomo's policy only reads maps created by `socketowner_t`, so the observer needs
-  that domain or a matching rule.
-  mihomo's service must also run this observer before games start.
+- **Deployment.** The service and separate observer domain are in
+  hardened-proxy-service. Install its updated policy, unit and observer binary
+  together; see its Wine process attribution instructions.
 - **Removed tests.** The fixture VM tests modelled wineserver's memory, which is no
   longer read. Exec revocation, nested PID namespaces with no capabilities, FD reuse
   and failed connects on the new capture have only incidental coverage.
-- **Untested:** new-style WOW64, IPv6 through the relay, and load. The per-packet
-  cost of `wine_egress`, which parses every packet on the host, has not been measured.
+- **Untested:** new-style WOW64, IPv6 through the relay, and load. Native per-packet cost is measured in the
+  [service validation](validation/service/README.md); Wine relay load remains untested.
 - **A multi-threaded wineserver** would break step 2 of capture. None exists among
   the tested runners; the design has no detection for one yet.
 - **DNS.** Flows sent to pasta's `--dns-forward` address are translated, so they

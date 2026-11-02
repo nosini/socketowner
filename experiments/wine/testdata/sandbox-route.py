@@ -27,11 +27,14 @@ p.add_argument('--runner', required=True, type=Path, help='directory holding win
 p.add_argument('--observer', required=True, type=Path)
 p.add_argument('--mihomo', required=True, type=Path)
 p.add_argument('--work', required=True, type=Path)
+p.add_argument('--observer-service', action='store_true', help='use the installed systemd observer and its shared maps; leaves it running')
 p.add_argument('--bits', type=int, default=64, choices=(32, 64), help='mingw PE probes')
 a = p.parse_args()
 for name in ('sandbox', 'runner', 'observer', 'mihomo', 'work'):
     setattr(a, name, getattr(a, name).resolve())
 a.work.mkdir(parents=True, exist_ok=True)
+if a.observer_service:
+    PIN = '/sys/fs/bpf/mihomo/maps'
 source = Path(__file__).resolve().parent
 proton = a.work / 'proton'
 compiler = {32: 'i686-w64-mingw32-gcc', 64: 'x86_64-w64-mingw32-gcc'}[a.bits]
@@ -100,9 +103,20 @@ rules:
     echo = subprocess.Popen(['python3', str(source / 'echo-server.py'), HOST],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     records = []
-    observer = subprocess.Popen(['sudo', '-n', str(a.observer), '-pin', PIN],
-                                stdout=subprocess.PIPE, stderr=(a.work / 'observer-stderr.log').open('w'), text=True)
-    root.append(observer)
+    if a.observer_service:
+        # Restart first so the journal stream belongs to exactly one observer.
+        sudo('systemctl', 'restart', 'socketowner-wine-observer.service')
+        invocation = subprocess.run(['systemctl', 'show', '-p', 'InvocationID', '--value',
+                                     'socketowner-wine-observer.service'],
+                                    check=True, capture_output=True, text=True).stdout.strip()
+        observer = subprocess.Popen(['sudo', '-n', 'journalctl', '-f', '-o', 'cat',
+                                     '_SYSTEMD_INVOCATION_ID=' + invocation],
+                                    stdout=subprocess.PIPE, text=True)
+        root.append(observer)
+    else:
+        observer = subprocess.Popen(['sudo', '-n', str(a.observer), '-pin', PIN],
+                                    stdout=subprocess.PIPE, stderr=(a.work / 'observer-stderr.log').open('w'), text=True)
+        root.append(observer)
     ready = threading.Event()
 
     def collect():
@@ -110,12 +124,16 @@ rules:
             for line in observer.stdout:
                 log.write(line)
                 log.flush()
-                records.append(json.loads(line))
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                records.append(value)
                 if records[-1]['type'] == 'ready':
                     ready.set()
     reader = threading.Thread(target=collect, daemon=True)
     reader.start()
-    assert ready.wait(10), 'observer not ready: ' + (a.work / 'observer-stderr.log').read_text()
+    assert ready.wait(10), 'observer not ready; see events.jsonl or observer-stderr.log'
     time.sleep(.5)
 
     for probe, _ in PROGRAMS:
@@ -152,8 +170,11 @@ rules:
     subprocess.run(['sudo', '-n', 'pkill', '-TERM', '-P', str(observer.pid)], check=True)
     observer.wait(timeout=15)
     reader.join(timeout=5)
-    assert sudo_ls(PIN) == []
-    assert (a.work / 'observer-stderr.log').read_text() == ''
+    if a.observer_service:
+        assert 'wine_flows' in sudo_ls(PIN)
+    else:
+        assert sudo_ls(PIN) == []
+        assert (a.work / 'observer-stderr.log').read_text() == ''
     print('PASS: two unpaused sandboxes routed by name.', flush=True)
 finally:
     for probe, process in sandboxes.items():
@@ -169,4 +190,5 @@ finally:
         echo.wait(timeout=5)
     subprocess.run(['sudo', '-n', 'nft', 'delete', 'table', 'inet', 'wine_sandbox_test'], check=False)
     subprocess.run(['sudo', '-n', 'ip', 'addr', 'del', HOST + '/32', 'dev', 'lo'], check=False)
-    subprocess.run(['sudo', '-n', 'rm', '-rf', PIN], check=False)
+    if not a.observer_service:
+        subprocess.run(['sudo', '-n', 'rm', '-rf', PIN], check=False)

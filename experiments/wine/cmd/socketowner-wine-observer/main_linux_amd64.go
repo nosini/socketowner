@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"os/user"
@@ -42,7 +43,32 @@ func run() error {
 	encoder := json.NewEncoder(os.Stdout)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return wine.Observe(ctx, options, func(e wine.Event) error { return encoder.Encode(e) })
+	return wine.Observe(ctx, options, func(e wine.Event) error {
+		if err := encoder.Encode(e); err != nil {
+			return err
+		}
+		if e.Type == "ready" {
+			return notifyReady()
+		}
+		return nil
+	})
+}
+
+// notifyReady also permits direct command-line use without systemd.
+func notifyReady() error {
+	address := os.Getenv("NOTIFY_SOCKET")
+	if address == "" {
+		return nil
+	}
+	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: address, Net: "unixgram"})
+	if err != nil {
+		return fmt.Errorf("systemd readiness: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("READY=1")); err != nil {
+		return fmt.Errorf("systemd readiness: %w", err)
+	}
+	return nil
 }
 
 func main() {

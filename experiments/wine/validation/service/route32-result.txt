@@ -1,0 +1,9 @@
+[TCP] 198.18.77.1:44322(beta.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(beta.exe) using REJECT
+[TCP] 198.18.77.1:44326(beta.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(beta.exe) using REJECT
+[TCP] 198.18.77.1:44336(alpha.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(alpha.exe) using DIRECT
+[TCP] 198.18.77.1:44352(alpha.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(alpha.exe) using DIRECT
+alpha.exe mihomo matches 2 relays 3
+beta.exe mihomo matches 2 relays 3
+pastas 2 wineservers with traffic 2
+unknown relays 0
+PASS: two unpaused sandboxes routed by name.

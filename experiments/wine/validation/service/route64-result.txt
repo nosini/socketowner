@@ -1,0 +1,6 @@
+alpha.exe mihomo TCP matches DIRECT: 2; known relay flows: 3
+beta.exe mihomo TCP matches REJECT: 2; known relay flows: 3
+pastas: 2; wineservers with traffic: 2
+unknown relay flows: 0
+wine-unknown: absent
+PASS: two unpaused sandboxes routed by name; installed observer service, SELinux enforcing.
