@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	wineABI      uint32 = 1
+	wineABI      uint32 = 2
 	flowsPin            = "wine_flows"
 	abiPin              = "wine_abi"
 	heartbeatPin        = "wine_heartbeat"

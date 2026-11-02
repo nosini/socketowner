@@ -64,7 +64,7 @@ executable. A loader update takes effect when its service is restarted.
 See [development](docs/development.md) for source builds and tests.
 
 An optional [Wine observer experiment](experiments/wine/README.md) identifies
-Windows socket creators from an unchanged, verified wineserver build. It is a
+Windows socket creators in unchanged Wine, needing no per-build data. It is a
 separate command, which can also publish them for mihomo through a sandbox's
 pasta. It is started by hand and has no service integration.
 

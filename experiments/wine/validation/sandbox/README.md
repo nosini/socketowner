@@ -1,5 +1,7 @@
 # Real sandbox validation, 2026-11-02
 
+**Historical.** This report predates profile-free capture, and its profile blocker no longer applies. See [always-on validation](../always-on/README.md).
+
 This repeats the [routing validation](../routing/README.md) inside real
 `sandbox-game --net`, at run-in-sandbox `8c22b9d`: bwrap with
 `--disable-userns`, its seccomp filter and Landlock layer, its PID namespace and

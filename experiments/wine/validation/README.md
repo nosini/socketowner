@@ -1,5 +1,7 @@
 # VM validation, 2026-10-28
 
+**Historical.** This report describes the profile-based observer, since replaced. See [always-on validation](always-on/README.md).
+
 The `wine-process-attribution` implementation was tested without installing a
 service or changing the desktop. These are diagnostic results. Source and reproduction commands are in the
 [experiment README](../README.md).

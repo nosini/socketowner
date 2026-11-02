@@ -1,7 +1,13 @@
 // Optional Wine adapter. No native socketowner map is replaced.
-// Only a pidfd-registered task with a matching executable may supply metadata.
-// Creator records are immutable after socket_post_create returns: a failed
-// connect or a different sender must not rewrite a socket's creator.
+//
+// wineserver creates and connects Windows programs' sockets, so the kernel sees
+// only wineserver. Which program asked is recoverable without reading Wine's
+// private structures: every client thread has a request pipe, and the
+// single-threaded server handles a request within the read which fetched it. A
+// FIFO read by wineserver therefore names the client of the sockets which follow.
+// Clients name themselves through public Windows layouts, so no build needs a
+// profile. Creator records are immutable after socket_post_create returns: a
+// failed connect or a different sender must not rewrite a socket's creator.
 //
 // A registered pasta carries a sandbox's traffic out through replacement
 // sockets. Its connect joins each one to the inner flow which caused it. The
@@ -14,25 +20,31 @@
 
 #define IMAGE_BYTES 1024
 #define KNOWN 1
-#define READ_FAILED 2
-#define INVALID_IMAGE 3
-#define CHANGED_REQUEST 4
-#define INVALID_PROCESS 5
+#define NO_CLIENT 2
+#define NO_IMAGE 3
 #define AMBIGUOUS_RELAY 6
 #define NO_INNER_FLOW 7
 #define NOT_WINE 8
+#define S_IFMT 0170000
+#define S_IFIFO 0010000
+#define MAY_WRITE 2
+#define MAY_READ 4
 // pasta handles a SYN as soon as it reads the TAP; older records are leftovers.
 #define RELAY_TTL_NS 2000000000ULL
 
-struct inode { unsigned long i_ino; } __attribute__((preserve_access_index));
-struct file { struct inode *f_inode; } __attribute__((preserve_access_index));
-struct mm_struct { struct file *exe_file; } __attribute__((preserve_access_index));
+struct inode { unsigned short i_mode; } __attribute__((preserve_access_index));
+struct qstr { const unsigned char *name; unsigned int len; } __attribute__((preserve_access_index));
+struct dentry { struct qstr d_name; } __attribute__((preserve_access_index));
+struct path { struct dentry *dentry; } __attribute__((preserve_access_index));
+struct file { struct inode *f_inode; struct path f_path; } __attribute__((preserve_access_index));
+struct vm_area_struct { struct file *vm_file; } __attribute__((preserve_access_index));
 struct net { __u64 net_cookie; } __attribute__((preserve_access_index));
 struct nsproxy { struct net *net_ns; } __attribute__((preserve_access_index));
+struct thread_struct { unsigned long gsbase; } __attribute__((preserve_access_index));
 struct task_struct {
 	struct task_struct *group_leader;
-	struct mm_struct *mm;
 	struct nsproxy *nsproxy;
+	struct thread_struct thread;
 	__u64 start_boottime;
 } __attribute__((preserve_access_index));
 struct sock_common { unsigned short skc_num; } __attribute__((preserve_access_index));
@@ -47,21 +59,32 @@ struct address {
 };
 struct msghdr;
 struct linux_binprm;
-struct bpf_iter_meta;
-struct bpf_iter__task {
-	struct bpf_iter_meta *meta;
-	struct task_struct *task;
-};
+struct bpf_iter_task_vma { __u64 __opaque[1]; };
+extern int bpf_iter_task_vma_new(struct bpf_iter_task_vma *it, struct task_struct *task, __u64 addr) __ksym;
+extern struct vm_area_struct *bpf_iter_task_vma_next(struct bpf_iter_task_vma *it) __ksym;
+extern void bpf_iter_task_vma_destroy(struct bpf_iter_task_vma *it) __ksym;
 
-struct target_config {
-	__u64 current_address, exe_inode, kernel_exe, netns;
-	__u32 thread_process, process_id, process_unix_pid;
-	__u32 process_start, process_img_len, process_image, active, sends;
+struct config {
+	__u64 host_netns;
+	__u32 sends, pad;
+};
+struct process_id {
+	__u64 start_ns;
+	__u32 tgid, pad;
+};
+struct server {
+	__u64 start_ns;
+};
+// encoding 0 is a full UTF-16 Windows path, 1 a mapped file's basename in bytes.
+struct client {
+	__u64 start_ns, peb;
+	__u32 status, image_bytes, encoding, windows_pid;
+	__u16 image[IMAGE_BYTES / 2];
 };
 struct owner {
-	__u64 socket_id, server_start_ns, windows_start_time, captured_boot_ns;
-	__u32 server_tgid, uid, windows_pid, client_unix_pid;
-	__u32 status, image_bytes, protocol, pad;
+	__u64 socket_id, server_start_ns, client_start_ns, captured_boot_ns;
+	__u32 server_tgid, uid, windows_pid, client_tgid;
+	__u32 status, image_bytes, protocol, encoding;
 	__u16 image[IMAGE_BYTES / 2];
 };
 struct storage {
@@ -104,11 +127,44 @@ struct event {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, int);
-	__type(value, struct target_config);
-} wine_targets SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct config);
+} wine_config SEC(".maps");
+// Keyed by the pipe's inode. A reused inode is safe: wineserver can't read a
+// request before its client's write has replaced the entry.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 65536);
+	__type(key, __u64);
+	__type(value, struct process_id);
+} request_pipes SEC(".maps");
+// The client each wineserver last read a request from.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u32);
+	__type(value, struct process_id);
+} serving SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u32);
+	__type(value, struct server);
+} servers SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32);
+	__type(value, struct client);
+} clients SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct client);
+} blank_client SEC(".maps");
 struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
@@ -121,8 +177,8 @@ struct {
 	__type(key, int);
 	__type(value, struct pasta_target);
 } pasta_targets SEC(".maps");
-// Public; see docs in ../README.md. Written from the socket record itself, so
-// the routing path does not depend on the diagnostic ring buffer.
+// Public; see ../README.md. Written from the socket record itself, so the
+// routing path does not depend on the diagnostic ring buffer.
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 16384);
@@ -143,12 +199,12 @@ struct {
 	__type(key, __u32);
 	__type(value, struct storage);
 } unlabelled SEC(".maps");
-// Slot 0 is the sandbox's network namespace cookie, or 0 with no pasta.
+// Sandboxes with a wineserver. Cookies are never reused.
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, __u64);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u64);
+	__type(value, __u32);
 } relay_netns SEC(".maps");
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -163,60 +219,28 @@ struct {
 	__type(value, __u64);
 } counters SEC(".maps");
 
-static __always_inline struct target_config *target(struct task_struct *task)
+// A name is no proof, but labels are cooperative anyway; see the README's limits.
+static __always_inline int is_server(void)
 {
-	struct target_config *c;
-	struct file *exe;
-	struct mm_struct *mm = task->mm;
-	__u64 pid = bpf_get_current_pid_tgid();
-	if ((__u32)pid != pid >> 32 || !mm)
-		return 0;
-	c = bpf_task_storage_get(&wine_targets, task->group_leader, 0, 0);
-	if (!c || !c->active || !c->kernel_exe)
-		return 0;
-	exe = mm->exe_file;
-	if (!exe || (__u64)exe != c->kernel_exe)
-		return 0;
-	return c;
+	char c[16] = {};
+	bpf_get_current_comm(c, sizeof(c));
+	return c[0] == 'w' && c[1] == 'i' && c[2] == 'n' && c[3] == 'e' && c[4] == 's' &&
+	       c[5] == 'e' && c[6] == 'r' && c[7] == 'v' && c[8] == 'e' && c[9] == 'r' && !c[10];
 }
 
-// Bind to the kernel-held executable file, not a userspace dev_t encoding.
-// Filesystems may report per-subvolume st_dev values. The selected task's
-// mm holds this file reference until exec, whose LSM hook revokes registration.
-SEC("iter/task")
-int wine_seed(struct bpf_iter__task *ctx)
+static __always_inline void lost_event(void)
 {
-	struct task_struct *task = ctx->task;
-	struct target_config *c;
-	struct mm_struct *mm;
-	struct file *exe;
-	struct inode *inode;
-	struct nsproxy *ns;
-	if (!task || task->group_leader != task || !(mm = task->mm))
-		return 0;
-	c = bpf_task_storage_get(&wine_targets, task, 0, 0);
-	if (!c || !c->active || c->kernel_exe)
-		return 0;
-	exe = mm->exe_file;
-	if (!exe || !(inode = exe->f_inode) || inode->i_ino != c->exe_inode) {
-		c->active = 0;
-		return 0;
-	}
-	ns = task->nsproxy;
-	if (ns)
-		c->netns = ns->net_ns->net_cookie;
-	c->kernel_exe = (__u64)exe;
-	return 0;
+	__u32 key = 1;
+	__u64 *losses = bpf_map_lookup_elem(&counters, &key);
+	if (losses)
+		__sync_fetch_and_add(losses, 1);
 }
 
 static __always_inline void emit(struct storage *s, __u32 kind, struct flow *f)
 {
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e) {
-		__u32 key = 1;
-		__u64 *losses = bpf_map_lookup_elem(&counters, &key);
-		if (losses)
-			__sync_fetch_and_add(losses, 1);
+		lost_event();
 		return;
 	}
 	e->kind = kind;
@@ -229,47 +253,165 @@ static __always_inline void emit(struct storage *s, __u32 kind, struct flow *f)
 	bpf_ringbuf_submit(e, 0);
 }
 
-// A read failure produces an unknown record for this new socket. Nothing falls
-// back to a previous socket's cached name, a short path, or the last request.
-static __always_inline __u32 read_creator(struct target_config *c, struct owner *o)
+// Tells userspace about a wineserver, and starts recording flows in its sandbox
+// before any of its programs can have sent one.
+static __always_inline void note_server(struct task_struct *task, __u32 tgid)
 {
-	__u64 thread = 0, process = 0, image = 0, again = 0;
-	__u32 length = 0, id = 0;
-	__u64 start = 0;
-	if (bpf_probe_read_user(&thread, 8, (void *)c->current_address) || !thread ||
-	    bpf_probe_read_user(&process, 8, (void *)(thread + c->thread_process)) || !process)
-		return READ_FAILED;
-	if (bpf_probe_read_user(&o->windows_pid, 4, (void *)(process + c->process_id)) ||
-	    bpf_probe_read_user(&o->client_unix_pid, 4, (void *)(process + c->process_unix_pid)) ||
-	    bpf_probe_read_user(&o->windows_start_time, 8, (void *)(process + c->process_start)) ||
-	    bpf_probe_read_user(&length, 4, (void *)(process + c->process_img_len)) ||
-	    bpf_probe_read_user(&image, 8, (void *)(process + c->process_image)))
-		return READ_FAILED;
-	if (!o->windows_pid || !o->client_unix_pid || o->client_unix_pid > 0x7fffffff || !o->windows_start_time)
-		return INVALID_PROCESS;
-	if (!image || length < 2 || length > IMAGE_BYTES || (length & 1))
-		return INVALID_IMAGE;
-	if (bpf_probe_read_user(o->image, length, (void *)image))
-		return READ_FAILED;
-	if (bpf_probe_read_user(&again, 8, (void *)c->current_address) || again != thread ||
-	    bpf_probe_read_user(&again, 8, (void *)(thread + c->thread_process)) || again != process ||
-	    bpf_probe_read_user(&again, 8, (void *)(process + c->process_image)) || again != image ||
-	    bpf_probe_read_user(&id, 4, (void *)(process + c->process_id)) || id != o->windows_pid ||
-	    bpf_probe_read_user(&start, 8, (void *)(process + c->process_start)) || start != o->windows_start_time ||
-	    bpf_probe_read_user(&id, 4, (void *)(process + c->process_img_len)) || id != length)
-		return CHANGED_REQUEST;
-	o->image_bytes = length;
-	return KNOWN;
+	struct task_struct *leader = task->group_leader;
+	struct server *known = bpf_map_lookup_elem(&servers, &tgid);
+	struct server record = { .start_ns = leader->start_boottime };
+	struct nsproxy *ns = task->nsproxy;
+	struct config *config;
+	struct event *e;
+	__u32 zero = 0, present = 1;
+	__u64 netns;
+	if ((known && known->start_ns == record.start_ns) || !ns)
+		return;
+	netns = ns->net_ns->net_cookie;
+	config = bpf_map_lookup_elem(&wine_config, &zero);
+	if (!config)
+		return;
+	bpf_map_update_elem(&servers, &tgid, &record, BPF_ANY);
+	if (netns == config->host_netns)
+		return;
+	bpf_map_update_elem(&relay_netns, &netns, &present, BPF_ANY);
+	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e) {
+		lost_event();
+		return;
+	}
+	__builtin_memset(e, 0, sizeof(*e));
+	e->kind = 6;
+	e->actor_tgid = tgid;
+	e->flow.netns = netns;
+	bpf_ringbuf_submit(e, 0);
+}
+
+// The first mapped file named *.exe, for 32-bit Linux clients, which have no
+// 64-bit TEB: only the name is available this way.
+static __always_inline int mapped_image(struct task_struct *task, struct client *c)
+{
+	struct bpf_iter_task_vma it;
+	struct vm_area_struct *v;
+	int found = 0;
+	if (bpf_iter_task_vma_new(&it, task, 0)) {
+		bpf_iter_task_vma_destroy(&it);
+		return 0;
+	}
+	while ((v = bpf_iter_task_vma_next(&it))) {
+		struct file *f = v->vm_file;
+		const unsigned char *name;
+		__u32 length, tail = 0;
+		if (!f)
+			continue;
+		length = f->f_path.dentry->d_name.len;
+		name = f->f_path.dentry->d_name.name;
+		if (length < 5 || length > IMAGE_BYTES || bpf_probe_read_kernel(&tail, 4, name + length - 4) ||
+		    (tail | 0x20202020) != 0x6578652e)
+			continue;
+		if (bpf_probe_read_kernel(c->image, length, name))
+			continue;
+		c->image_bytes = length;
+		c->encoding = 1;
+		found = 1;
+		break;
+	}
+	bpf_iter_task_vma_destroy(&it);
+	return found;
+}
+
+// These offsets are the Windows x86-64 TEB, PEB and process parameters: public
+// layouts, not Wine's. TEB.Self confirms GS holds a TEB. A failure is retried on
+// the client's next request, and leaves its sockets unknown until then.
+static __always_inline void read_client(struct task_struct *task, struct client *c)
+{
+	__u64 teb = task->thread.gsbase, self = 0, peb = 0, parameters = 0, buffer = 0, id = 0;
+	__u32 flags = 0;
+	__u16 length = 0;
+	if (!c->peb) {
+		if (!teb || bpf_probe_read_user(&self, 8, (void *)(teb + 0x30)) || self != teb ||
+		    bpf_probe_read_user(&peb, 8, (void *)(teb + 0x60)) || !peb) {
+			if (mapped_image(task, c))
+				c->status = KNOWN;
+			return;
+		}
+		if (!bpf_probe_read_user(&id, 8, (void *)(teb + 0x40)) && id && id <= 0xffffffff)
+			c->windows_pid = id;
+		c->peb = peb;
+	}
+	peb = c->peb;
+	if (bpf_probe_read_user(&parameters, 8, (void *)(peb + 0x20)) || !parameters ||
+	    bpf_probe_read_user(&flags, 4, (void *)(parameters + 8)) || !(flags & 1) ||
+	    bpf_probe_read_user(&length, 2, (void *)(parameters + 0x60)) ||
+	    bpf_probe_read_user(&buffer, 8, (void *)(parameters + 0x68)) || !buffer)
+		return;
+	if (length < 2 || length > IMAGE_BYTES || (length & 1))
+		return;
+	if (bpf_probe_read_user(c->image, length, (void *)buffer))
+		return;
+	c->image_bytes = length;
+	c->status = KNOWN;
+}
+
+SEC("lsm/file_permission")
+int BPF_PROG(wine_file, struct file *file, int mask, int ret)
+{
+	struct task_struct *task;
+	struct inode *inode;
+	struct process_id *pipe, id = {};
+	struct client *c;
+	__u64 key;
+	__u32 tgid, zero = 0;
+	if (ret)
+		return ret;
+	inode = file->f_inode;
+	if (!inode || (inode->i_mode & S_IFMT) != S_IFIFO || !(mask & (MAY_READ | MAY_WRITE)))
+		return 0;
+	key = (__u64)inode;
+	task = bpf_get_current_task_btf();
+	tgid = bpf_get_current_pid_tgid() >> 32;
+	if (is_server()) {
+		if (!(mask & MAY_READ))
+			return 0;
+		note_server(task, tgid);
+		pipe = bpf_map_lookup_elem(&request_pipes, &key);
+		if (pipe)
+			bpf_map_update_elem(&serving, &tgid, pipe, BPF_ANY);
+		else
+			bpf_map_update_elem(&request_pipes, &key, &id, BPF_NOEXIST);
+		return 0;
+	}
+	if (!(mask & MAY_WRITE) || !(pipe = bpf_map_lookup_elem(&request_pipes, &key)))
+		return 0;
+	id.tgid = tgid;
+	id.start_ns = task->group_leader->start_boottime;
+	bpf_map_update_elem(&request_pipes, &key, &id, BPF_EXIST);
+	c = bpf_map_lookup_elem(&clients, &tgid);
+	if (!c || c->start_ns != id.start_ns) {
+		struct client *blank = bpf_map_lookup_elem(&blank_client, &zero);
+		if (!blank)
+			return 0;
+		bpf_map_update_elem(&clients, &tgid, blank, BPF_ANY);
+		c = bpf_map_lookup_elem(&clients, &tgid);
+		if (!c)
+			return 0;
+		c->start_ns = id.start_ns;
+	}
+	if (c->status != KNOWN)
+		read_client(task, c);
+	return 0;
 }
 
 SEC("lsm/socket_post_create")
 int BPF_PROG(wine_create, struct socket *socket, int family, int type, int protocol, int kern, int ret)
 {
 	struct task_struct *task;
-	struct target_config *c;
+	struct process_id *request;
+	struct client *c = 0;
 	struct storage *s;
 	struct sock *sk;
-	__u32 key = 0;
+	struct config *config;
+	__u32 key = 0, tgid;
 	__u64 *seq, id;
 	if (ret)
 		return ret;
@@ -278,30 +420,40 @@ int BPF_PROG(wine_create, struct socket *socket, int family, int type, int proto
 	if (protocol && protocol != (type == 1 ? 6 : 17))
 		return 0;
 	sk = socket->sk;
-	if (!sk)
+	if (!sk || !is_server())
 		return 0;
 	task = bpf_get_current_task_btf();
-	if (!(c = target(task)))
-		return 0;
+	tgid = bpf_get_current_pid_tgid() >> 32;
 	s = bpf_sk_storage_get(&wine_sockets, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
 	if (!s || s->ready)
 		return 0;
 	seq = bpf_map_lookup_elem(&counters, &key);
-	if (!seq)
+	config = bpf_map_lookup_elem(&wine_config, &key);
+	if (!seq || !config)
 		return 0;
 	id = __sync_fetch_and_add(seq, 1) + 1;
-	if (!id) {
-		c->active = 0;
-		return 0;
-	}
 	s->owner.socket_id = id;
 	s->owner.server_start_ns = task->group_leader->start_boottime;
 	s->owner.captured_boot_ns = bpf_ktime_get_boot_ns();
-	s->owner.server_tgid = bpf_get_current_pid_tgid() >> 32;
+	s->owner.server_tgid = tgid;
 	s->owner.uid = bpf_get_current_uid_gid();
 	s->owner.protocol = type == 1 ? 6 : 17;
-	s->owner.status = read_creator(c, &s->owner);
-	s->sends = c->sends;
+	s->owner.status = NO_CLIENT;
+	request = bpf_map_lookup_elem(&serving, &tgid);
+	if (request && request->tgid) {
+		s->owner.client_tgid = request->tgid;
+		s->owner.client_start_ns = request->start_ns;
+		s->owner.status = NO_IMAGE;
+		c = bpf_map_lookup_elem(&clients, &request->tgid);
+	}
+	if (c && c->start_ns == request->start_ns && c->status == KNOWN &&
+	    !bpf_probe_read_kernel(s->owner.image, IMAGE_BYTES, c->image)) {
+		s->owner.windows_pid = c->windows_pid;
+		s->owner.image_bytes = c->image_bytes;
+		s->owner.encoding = c->encoding;
+		s->owner.status = KNOWN;
+	}
+	s->sends = config->sends;
 	// No other process can use this newly created socket before this hook
 	// returns. All owner fields remain immutable from this point onward.
 	__sync_lock_test_and_set(&s->ready, 1);
@@ -420,16 +572,16 @@ int BPF_PROG(wine_send, struct socket *socket, struct msghdr *msg, int size, int
 	return 0;
 }
 
+// exec replaces both the client's identity and a pasta's registration.
 SEC("lsm/bprm_committed_creds")
 int BPF_PROG(wine_exec, struct linux_binprm *bprm)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
-	struct target_config *c = bpf_task_storage_get(&wine_targets, task->group_leader, 0, 0);
 	struct pasta_target *t = bpf_task_storage_get(&pasta_targets, task->group_leader, 0, 0);
-	if (c)
-		c->active = 0;
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	if (t)
 		t->active = 0;
+	bpf_map_delete_elem(&clients, &tgid);
 	return 0;
 }
 
@@ -500,8 +652,8 @@ static __always_inline int same_owner(struct storage *a, struct storage *b)
 	return a->ready && a->owner.status == KNOWN && b->owner.status == KNOWN &&
 	       a->owner.server_tgid == b->owner.server_tgid &&
 	       a->owner.server_start_ns == b->owner.server_start_ns &&
-	       a->owner.windows_pid == b->owner.windows_pid &&
-	       a->owner.windows_start_time == b->owner.windows_start_time;
+	       a->owner.client_tgid == b->owner.client_tgid &&
+	       a->owner.client_start_ns == b->owner.client_start_ns;
 }
 
 // Runs before the packet can reach pasta. Unlabelled flows are recorded too: a
@@ -562,8 +714,6 @@ int wine_egress(struct __sk_buff *skb)
 	struct conn_key key = {};
 	struct flow f = {};
 	struct bpf_sock *sk = skb->sk;
-	__u32 zero = 0;
-	__u64 *relay;
 	if (!sk)
 		return 1;
 	s = bpf_sk_storage_get(&wine_sockets, sk, 0, 0);
@@ -571,8 +721,7 @@ int wine_egress(struct __sk_buff *skb)
 		s = 0;
 	if (!packet_flow(skb, &f))
 		return 1;
-	relay = bpf_map_lookup_elem(&relay_netns, &zero);
-	if (relay && *relay && *relay == f.netns)
+	if (bpf_map_lookup_elem(&relay_netns, &f.netns))
 		note_inner_flow(&f, s);
 	key.netns = f.netns;
 	__builtin_memcpy(key.address, f.source, 16);

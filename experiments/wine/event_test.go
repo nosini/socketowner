@@ -39,8 +39,8 @@ func TestWindowsImage(t *testing.T) {
 }
 
 func TestUnknownDoesNotLeakPartialIdentity(t *testing.T) {
-	for _, status := range []uint32{1, 2, 3, 4, 5} {
-		r := rawEvent{Kind: 3, ActorTGID: 44, Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: status, Protocol: 6, WindowsPID: 123, ClientUnixPID: 45, WindowsStartTime: 90, ImageBytes: 5}}
+	for _, status := range []uint32{2, 3, 6, 7, 8} {
+		r := rawEvent{Kind: 3, ActorTGID: 44, Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: status, Protocol: 6, WindowsPID: 123, ClientTGID: 45, ClientStartNS: 90, ImageBytes: 5}}
 		copy(r.Owner.Image[:], utf16.Encode([]rune(`C:\partial.exe`)))
 		var b bytes.Buffer
 		if err := binary.Write(&b, binary.NativeEndian, r); err != nil {
@@ -60,7 +60,7 @@ func TestUnknownDoesNotLeakPartialIdentity(t *testing.T) {
 }
 
 func TestDecodeEgress(t *testing.T) {
-	r := rawEvent{Kind: 4, ActorTGID: 44, Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: 1, Protocol: 6, WindowsPID: 123, ClientUnixPID: 45, WindowsStartTime: 90}}
+	r := rawEvent{Kind: 4, ActorTGID: 44, Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: 1, Protocol: 6, WindowsPID: 123, ClientTGID: 45, ClientStartNS: 90}}
 	w := utf16.Encode([]rune(`\??\C:\games\alpha.exe`))
 	copy(r.Owner.Image[:], w)
 	r.Owner.ImageBytes = uint32(len(w) * 2)
@@ -101,5 +101,43 @@ func TestDecodeRelayUnknown(t *testing.T) {
 	}
 	if e.Type != "relay" || e.Status != "ambiguous-relay" || e.WindowsName != "" || e.WindowsImage != "" {
 		t.Fatalf("unexpected relay event: %+v", e)
+	}
+}
+
+func TestDecodeMappedName(t *testing.T) {
+	r := rawEvent{Kind: 3, ActorTGID: 44, Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: 1, Protocol: 17, Encoding: 1, ImageBytes: 9, ClientTGID: 45}}
+	for i, b := range []byte("alpha.exe") {
+		r.Owner.Image[i/2] |= uint16(b) << (8 * (i % 2))
+	}
+	var data bytes.Buffer
+	if err := binary.Write(&data, binary.NativeEndian, r); err != nil {
+		t.Fatal(err)
+	}
+	e, err := decodeEvent(data.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Status != "known" || e.WindowsName != "alpha.exe" || e.WindowsImage != "" {
+		t.Fatalf("unexpected event: %+v", e)
+	}
+	if _, err := mappedName(r.Owner.Image[:], 0); err == nil {
+		t.Fatal("empty name accepted")
+	}
+	r.Owner.Image[0] = 'a' | '/'<<8
+	if _, err := mappedName(r.Owner.Image[:], 9); err == nil {
+		t.Fatal("name with a directory accepted")
+	}
+}
+
+func TestDecodeServer(t *testing.T) {
+	r := rawEvent{Kind: 6, ActorTGID: 44}
+	r.Flow.NetNS = 9
+	var data bytes.Buffer
+	if err := binary.Write(&data, binary.NativeEndian, r); err != nil {
+		t.Fatal(err)
+	}
+	e, err := decodeEvent(data.Bytes())
+	if err != nil || e.Type != "server" || e.ServerTGID != 44 || e.NetNS != 9 {
+		t.Fatalf("unexpected event: %+v, %v", e, err)
 	}
 }

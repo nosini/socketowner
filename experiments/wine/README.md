@@ -1,18 +1,18 @@
 # Observe Windows socket creators from the host
 
-This optional command identifies the Windows program which creates an outgoing
-TCP/UDP socket in an unchanged, explicitly selected wineserver. It prints JSON
-diagnostics for socket creation, connect attempts and the first outgoing packet.
-With `-pin` it publishes those identities for mihomo's `PROCESS-NAME` and
-`PROCESS-PATH` rules, and with `-pasta-pid` they survive a sandbox's pasta.
-No Wine or pasta patch, injected DLL, uprobe, TLS adapter or sandbox capability
-is needed.
+This optional command names the Windows program behind each outgoing TCP/UDP
+socket of every wineserver on the machine, for as long as it runs. It prints JSON
+diagnostics, and with `-pin` publishes the identities for mihomo's `PROCESS-NAME`
+and `PROCESS-PATH` rules, through each sandbox's pasta.
 
-This remains an experiment, started by hand for one sandbox; see
-[what is missing](#what-is-missing). It leaves native socketowner maps unchanged.
-Do not use the diagnostic event stream as a routing authority: readers use the
-pinned [routing maps](#routing-maps). Unsupported binaries are refused;
-unreadable or incomplete Windows metadata is reported without an executable name.
+It needs no Wine or pasta patch, injected DLL, uprobe, TLS adapter or sandbox
+capability, and no per-build profile. It is told nothing about Wine: wineservers
+and their pastas are found as they appear, so it only has to be running before a
+game starts.
+
+This remains an experiment; see [what is missing](#what-is-missing). It leaves
+native socketowner maps unchanged. Do not use the diagnostic event stream as a
+routing authority: readers use the pinned [routing maps](#routing-maps).
 
 ## Build and run
 
@@ -21,96 +21,102 @@ command explicitly, on Linux amd64:
 
 ```sh
 CGO_ENABLED=0 go build -o socketowner-wine-observer ./experiments/wine/cmd/socketowner-wine-observer
+sudo ./socketowner-wine-observer -pin /sys/fs/bpf/mihomo/maps -reader-group mihomo
 ```
 
-Prepare a profile from a **trusted wineserver binary with its matching DWARF and
-symbol table**, then review the generated file:
+Without `-pin` it only prints diagnostics. `-sends` also reports send attempts,
+including the Linux process performing each send. `-cgroup` selects the cgroup v2
+ancestor used for egress observation; its default is `/sys/fs/cgroup`. Select an
+ancestor covering Wine and pasta. Stop it with Ctrl-C. Nothing stays attached
+after it exits or crashes. Pins are removed on exit; a crash leaves them until the
+next publisher.
 
-```sh
-./socketowner-wine-observer -make-profile /path/to/wineserver > wine-profile.json
-```
+The observer needs host BPF/LSM and cgroup attachment privileges, and permission
+to inspect other processes' file descriptors to find pasta, so `CAP_SYS_PTRACE`
+in addition to `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`. Root in the test VM
+supplies these rights. No service or SELinux policy change is included. Wine and
+games remain unprivileged.
 
-Profile generation needs no BPF attachment. A stripped binary needs a separately
-reviewed profile for its exact SHA-256. The checked-in
-[test-build profile](profiles/wineserver-3bb468ca4d60c890.json) admits only the
-specific DW-based build used in VM validation, not every DW 11.0-15 release.
-
-Select the wineserver's **host PID**, and start the observer before the Windows
-program creates its sockets:
-
-```sh
-sudo ./socketowner-wine-observer -profile wine-profile.json -pid HOST_PID
-```
-
-`HOST_PID` is a placeholder for a numeric process ID. `-sends` also reports send
-attempts, including the Linux process performing each send. `-cgroup` selects
-the cgroup v2 ancestor used for first-packet observation; its default is
-`/sys/fs/cgroup`. Select an ancestor covering both wineserver and the clients
-which use its FDs. The LSM hooks are globally attached but accept metadata only
-from the registered task and observe only its labelled sockets.
-
-Add `-pasta-pid PID` for the sandbox's pasta, and `-pin DIR` with
-`-reader-group GROUP` to publish [routing maps](#routing-maps).
-
-Wait for the `ready` event before launching the program. Sockets which already
-existed when observation started remain unlabelled. Stop with Ctrl-C. Target or
-pasta exit stops the observer; exec revokes registration. Nothing stays attached
-after the command exits or crashes. Pins are removed on exit; a crash leaves them
-until the next publisher.
-
-The observer needs host BPF/LSM/iterator and cgroup attachment privileges, and
-permission to inspect the selected process's executable and mappings. Depending
-on process credentials and policy, preparation may require `CAP_SYS_PTRACE` in
-addition to `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`. Root in the test VM
-supplies these rights. No service or SELinux policy change is included; adding
-this command to a host service is a separate step. Wine and games remain
-unprivileged.
+A wineserver which predates the observer is picked up at its next request, but
+sockets it already created stay unlabelled.
 
 ## What the events mean
 
-Each observation carries an unpredictable `observer` lifetime ID and a
-`socket_id` unique within that lifetime. This ID is **not** Linux `SO_COOKIE`.
-Events include the wineserver's host TGID/start time, Windows PID/start time,
-complete normalized Windows image, and basename. `client_unix_pid` is in
-wineserver's PID namespace; it must not be treated as a host PID.
+`ready` and `stopped` bracket a run. `server` reports a wineserver in another
+network namespace, and `pasta` the relay registered for it.
+
+Each observation carries an unpredictable `observer` lifetime ID and a `socket_id`
+unique within that lifetime. This ID is **not** Linux `SO_COOKIE`. Events include
+the wineserver's host TGID and start time, and the client's host TGID and start
+time, with the Windows PID and image where known.
 
 `first-egress` adds the network namespace cookie and the packet's source and
 destination addresses/ports, including any translation already applied when the
-cgroup egress hook runs. TCP flags permit checking that the first observed
-packet was the SYN. This event is emitted once per socket; later UDP peers are
-not a complete flow table. Packet/header parsing is limited to TCP/UDP,
-IPv4 with options and up to eight supported IPv6 extension headers;
-noninitial fragments and unsupported protocols are omitted.
+cgroup egress hook runs. TCP flags permit checking that the first observed packet
+was the SYN. This event is emitted once per socket; later UDP peers are not a
+complete flow table. Packet/header parsing is limited to TCP/UDP, IPv4 with options
+and up to eight supported IPv6 extension headers; noninitial fragments and
+unsupported protocols are omitted.
 
 `relay` reports a pasta socket joined to its inner flow, or its unknown status.
 
 The identity describes the **Windows socket creator**. It is immutable after
 creation. A subsequent connect attempt, failed connect, or send through a
 duplicated/inherited FD does not replace it with the requesting process. The
-actual sending Linux TGID is a separate field. This is deliberately distinct
-from native socketowner's latest-Linux-user semantics. Connect/send diagnostics
-describe attempted operations, not successful completion.
+actual sending Linux TGID is a separate field. This is deliberately distinct from
+native socketowner's latest-Linux-user semantics. Connect/send diagnostics describe
+attempted operations, not successful completion.
 
-Read failures, an absent current request, oversized/odd-length image data,
-incomplete UTF-16, relative paths or malformed process identity produce unknown
-records with no Windows image/PID. There is no partial-path fallback. Paths
-are limited to 1024 UTF-16 bytes; no truncated path becomes a matchable name.
+A client whose name could not be read has status `no-image`, and a socket with no
+known client `no-client`. Neither carries a partial name. Paths are limited to 1024
+UTF-16 bytes; no truncated path becomes a matchable name.
 
 The event buffer is bounded. Buffer exhaustion increments a reported `loss`
-count; short-lived/late-attached sockets, shutdown and unsupported packet paths
-can also leave incomplete diagnostics. Records retained by an external log
-reader have no continuing authority after the observer exits. A future routing
-reader needs its own lifecycle, publication and unknown-result contract.
+count, and a lost `server` event leaves that sandbox's pasta unregistered. Routing
+records do not pass through this buffer.
+
+## How capture works
+
+wineserver creates and connects Windows programs' sockets, so kernel hooks see
+only wineserver. Which program asked is recoverable from Wine's request protocol:
+
+1. Each client thread has a request pipe. wineserver's read from a FIFO marks it,
+   and the next write by another process names that pipe's client
+   (`lsm/file_permission`).
+2. Each later read records the client being served. wineserver is single-threaded
+   and handles a request within the read which fetched it, so the sockets which
+   follow are that client's (`lsm/socket_post_create`).
+3. The client names itself, read during its own write, while its memory is
+   current. For 64-bit clients, GS holds the TEB, confirmed by `TEB.Self`, and
+   `Peb`, `ProcessParameters` and `ImagePathName` lead to the full path. These are
+   public Windows x86-64 layouts, not Wine's.
+4. 32-bit programs run as true 32-bit Linux processes on the tested runners, so
+   GS is glibc's TLS and that check fails. They fall back to the first mapped file
+   named `*.exe`, which gives the name but not the path, and no Windows PID.
+
+Client records carry the process's start time and are dropped on exec, so a reused
+PID can't inherit a name. A failed read is retried on the client's next request.
+
+The record is published before socket creation returns to userspace, and remains
+immutable in socket storage. Connect/send/egress hooks use that record instead of
+traversing an FD table or reconstructing an earlier request.
+
+wineserver is recognised by its process name. This supports cooperative Wine
+applications, not a security claim. A malicious process can rename itself, rewrite
+its own PEB, map a misleading file, or ask another program to do its networking.
+The cost: FIFO reads and writes system-wide pay about 130 ns per round trip, which
+was 37% in a benchmark doing nothing else.
 
 ## Routing maps
 
 `-pin DIR`, normally socketowner's `maps` directory, adds three optional pins
 beside its ABI v1 maps. V1 records are unchanged, so no v1 version change applies.
-These have their own version, and their pins come and go with the observer:
+These have their own version, currently 2, and their pins come and go with the
+observer:
 
 | Pin | Linux map type | Key bytes | Value bytes | Meaning |
 | --- | --- | ---: | ---: | --- |
-| `wine_abi` | `ARRAY` (2) | 4 | 4 | Frozen; key 0 holds version 1 |
+| `wine_abi` | `ARRAY` (2) | 4 | 4 | Frozen; key 0 holds the version |
 | `wine_heartbeat` | `ARRAY` (2) | 4 | 8 | Key 0 holds `CLOCK_BOOTTIME` nanoseconds, updated every second |
 | `wine_flows` | `LRU_HASH` (9) | 32 | 1088 | Identity by outgoing packet source |
 
@@ -121,21 +127,24 @@ connection key. All integers are native endian. The value is:
 | ---: | --- | --- |
 | 0 | uint64 | Socket ID, unique within one observer lifetime; not `SO_COOKIE` |
 | 8 | uint64 | wineserver start, `CLOCK_BOOTTIME` nanoseconds |
-| 16 | uint64 | Windows process start time, as wineserver records it |
+| 16 | uint64 | Client start, `CLOCK_BOOTTIME` nanoseconds |
 | 24 | uint64 | `CLOCK_BOOTTIME` nanoseconds at capture |
 | 32 | uint32 | wineserver host TGID |
 | 36 | uint32 | UID of the capturing process |
-| 40 | uint32 | Windows PID |
-| 44 | uint32 | Client Unix PID, in wineserver's PID namespace |
+| 40 | uint32 | Windows PID, or 0 if unavailable |
+| 44 | uint32 | Client host TGID |
 | 48 | uint32 | Status; only 1 names a program |
 | 52 | uint32 | Image length in bytes |
 | 56 | uint32 | IP protocol |
-| 60 | uint32 | Padding |
-| 64 | uint16[512] | Windows image, UTF-16, not NUL terminated |
+| 60 | uint32 | Image encoding |
+| 64 | uint16[512] | Image, not NUL terminated |
 
-Status 1 is known. 2-5 are the capture failures listed above. 6 means owners
-differed while waiting for pasta, 7 that pasta's socket matched no inner flow,
-and 8 that the inner flow came from a socket with no Windows identity.
+Encoding 0 is a full Windows path in UTF-16. Encoding 1 is a filename in bytes,
+with no directory. Readers must reject other values.
+
+Status 1 is known. 2 means no client was known, 3 that its name could not be read,
+6 that owners differed while waiting for pasta, 7 that pasta's socket matched no
+inner flow, and 8 that the inner flow came from a socket with no Windows identity.
 
 The kernel writes a record before the packet it describes leaves `wine_egress`,
 so it precedes mihomo's first lookup; it does not depend on the event buffer.
@@ -159,7 +168,8 @@ rules:
 
 A crash leaves the pins, which a new publisher replaces once the heartbeat has
 expired. While no observer runs, new flows have no record and show as pasta.
-A rule for the sandbox's pasta name can decide what those may do.
+A rule for the sandbox's pasta name can decide what those may do. `PROCESS-PATH`
+rules can't match a 32-bit client's full path, because it isn't known.
 
 ## How the relay works
 
@@ -181,122 +191,63 @@ an owner the result is the same whichever connect comes first. If not, all of
 them are ambiguous and stay unknown: waiting flows are never paired by arrival
 order. Records older than two seconds are ignored.
 
-`-pasta-pid` is refused unless that process holds a descriptor for the target's
-network namespace. Registration is keyed by pidfd and revoked on exec. No pasta
-memory is read, so pasta needs no profile and its updates don't affect one.
-The relay inherits the Wine trust limit below, and a sandboxed program can
-provoke unknown results by racing another program to one destination.
+A wineserver's first request tells BPF its network namespace, and from then on
+flows there are recorded, before any of its programs can have sent one. The
+observer then looks for the sandbox's pasta: a process outside that namespace,
+holding a descriptor for it, whose executable name contains `pasta`. Registration
+is keyed by pidfd and revoked on exec. No pasta memory is read, so its updates
+don't matter. A flow pasta connects before that registration has no record, and
+shows as pasta; this did not occur in testing, but nothing prevents it.
 
-## How registration works
-
-The operator supplies a trusted layout profile. Preparation opens a pidfd and
-the running `/proc/PID/exe`, hashes that exact file, checks ELF architecture and
-relocates `current` using executable dev/inode mappings. Fixed-address ELF and
-PIE/ASLR builds are supported. The selected wineserver must initially be
-single-threaded; only its leader can capture request metadata.
-
-Registration is in BPF task storage keyed from the original pidfd, not a
-reusable numeric PID. An iterator seeds the kernel-held `mm->exe_file`
-reference, and preparation rechecks the executable and mappings before
-publishing readiness. Every new capture verifies that same kernel file;
-`bprm_committed_creds` revokes registration on exec. The private registration map
-is frozen against later userspace writes. No kernel file pointer is emitted.
-
-At `socket_post_create`, the host LSM hook reads wineserver's live
-`current -> thread.process -> image/PID/start_time` and labels the actual held
-kernel socket. It checks request pointers/identity again after reading. The
-record is published before socket creation returns to userspace, and remains
-immutable in socket storage. Connect/send/egress hooks use that record instead
-of traversing an FD table or reconstructing an earlier request.
-
-Win32's public API stability supplies a common application boundary; it does
-not stabilize the internal structures read here. Profiles remain build
-specific. The selected runner must remain unchanged during observation. This
-supports cooperative Wine applications, not a security claim against a
-malicious process capable of modifying wineserver memory/code or delegating
-network activity to other programs.
+The relay inherits the capture's trust limit, and a sandboxed program can provoke
+unknown results by racing another program to one destination.
 
 ## Validation
 
-Recorded results and raw evidence are in [validation](validation/README.md).
-The earlier [research and proof-of-concept evidence](research/README.md) explain
-the design choices and the remaining Wine-to-pasta attribution problem.
-
-Ordinary tests check profile/UTF-16 refusal, ELF/DWARF generation, PIE relocation,
-mapped file identity, BPF structure layout and event decoding:
-
-```sh
-go test ./...
-```
+[Always-on validation](validation/always-on/README.md) covers this design, with
+real pasta, mihomo, nftables and `sandbox-game`. [NIKKE's launcher](validation/nikke/README.md) was observed on the desktop, without
+routing. Earlier reports are history: the
+[first observer](validation/README.md), [routing](validation/routing/README.md),
+[sandbox](validation/sandbox/README.md) and
+[prototype](research/generic-capture/README.md) records describe superseded
+capture or attachment. The [research](research/README.md) explains the design.
 
 Regenerate the embedded object after a BPF change using clang/llvm and libbpf
 headers, then rebuild:
 
 ```sh
 go generate ./experiments/wine
+go test ./...
 ```
 
-Privileged tests belong in the dedicated test VM. They compile a controlled
-request-object fixture; this fixture is not Wine. Run the tests in a private
-network namespace, using an absolute path for `WINE_FIXTURE`:
-
-```sh
-gcc -g -O0 -fPIE -pie -Wall -Wextra -Werror experiments/wine/testdata/wineserver-fixture.c -o /absolute/task/wineserver-fixture
-go test -c -tags wine_vm -o /absolute/task/wine.test ./experiments/wine
-sudo env WINE_FIXTURE=/absolute/task/wineserver-fixture unshare --net sh -c 'ip link set lo up; exec /absolute/task/wine.test -test.v -test.run TestWineObserverVM -test.timeout 100s'
-```
-
-The kernel tests cover ordinary and nested PID/user namespaces, zero sandbox
-capabilities, correct netns cookie, IPv4/IPv6 TCP SYN and unconnected UDP,
-failed-connect creator preservation, a fork sending through an inherited socket,
-an unregistered fork creating its own socket, malformed/oversized/absent request
-data, repeated FD reuse, observer restart, target exit and exec revocation.
-
-The [routing test](validation/routing/README.md) runs the same way, with real
-pasta, mihomo and nftables around Wine:
-
-```sh
-python3 experiments/wine/testdata/pasta-route.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/route
-```
-
-`--control` repeats it without the relay, where no rule may see a Windows name.
-
-`testdata/sandbox-route.py` does the same inside real `sandbox-game --net`, with
-`--pe` for native PE probes; see its [results](validation/sandbox/README.md).
-
-A separate real-Wine smoke test runs as the ordinary VM user. Only its observer
-uses sudo. It requires the existing Wine runner's compiler and writes only to
-the supplied task directory:
+Privileged tests belong in the dedicated test VM, and run as the ordinary user;
+only the observer, mihomo and test firewall rules use sudo:
 
 ```sh
 python3 experiments/wine/testdata/real-wine.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --work /absolute/task/real-wine
+python3 experiments/wine/testdata/pasta-route.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/route
+python3 experiments/wine/testdata/sandbox-route.py --sandbox /path/to/run-in-sandbox --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/sandbox
 ```
 
-This compiles two 64-bit Winelib probes, uses a private prefix and loopback echo
-listeners, and checks three distinct sockets/first packets per Windows image:
-ordinary TCP, ConnectEx TCP, and UDP sendto before connect. The probes also
-complete a pending overlapped receive and connected UDP. It verifies the
-Windows PID against each probe's own output and target-exit cleanup.
-
-The tested real runner was an unchanged existing DW 11.0-15-based build.
+`pasta-route.py --control` repeats its run without the relay, where no rule may see
+a Windows name. `sandbox-route.py --bits 32` uses 32-bit probes. Probes need Wine's
+`winegcc` or mingw.
 
 ## What is missing
 
-- **Launch integration.** The observer needs the wineserver and pasta PIDs, and
-  must be ready before the program's first socket. Nothing automates that yet,
-  and an earlier socket stays unlabelled. A root observer can't be asked from
-  inside a sandbox, and a real launch has no pause for it to attach.
-- **Packaged runners.** Those without DWARF, such as packaged DW releases, can't
-  generate a profile yet; see the [sandbox validation](validation/sandbox/README.md).
-- **Several sandboxes.** One observer serves one wineserver and one pasta, and
-  one publisher may use a pin directory. A second sandbox is refused.
 - **Deployment.** No service unit, SELinux policy or reader-group setup exists.
-- **Untested:** NIKKE, 32-bit PE through WOW64, Proton's launch script, IPv6
-  through the relay, UDP through a mihomo inbound (only its published record was
-  checked), other DW builds, and load. The per-packet cost of `wine_egress`,
-  which now parses every packet on the host, has not been measured.
+  mihomo's service must also run this observer before games start.
+- **Removed tests.** The fixture VM tests modelled wineserver's memory, which is no
+  longer read. Exec revocation, nested PID namespaces with no capabilities, FD reuse
+  and failed connects on the new capture have only incidental coverage.
+- **Untested:** the game itself past its launcher, whether routing by name works
+  on the desktop, new-style WOW64, IPv6 through the relay, UDP through a mihomo inbound (only its
+  published record was checked), and load. The per-packet cost of `wine_egress`,
+  which parses every packet on the host, has not been measured.
+- **A multi-threaded wineserver** would break step 2 of capture. None exists among
+  the tested runners; the design has no detection for one yet.
 - **DNS.** Flows sent to pasta's `--dns-forward` address are translated, so they
-  find no inner record and will be unknown. A rule refusing `wine-unknown` should
-  exempt them. Reasoned from pasta's source, not tested.
+  find no inner record and are unknown, [as seen in NIKKE](validation/nikke/README.md).
+  A rule refusing `wine-unknown` must exempt any it reaches.
 - **UDP reuse.** A new inner socket reusing a live UDP 4-tuple inherits pasta's
   existing flow, and with it the previous owner until that flow expires.

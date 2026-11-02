@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""VM-only end-to-end test: a Windows program inside real sandbox-game --net.
+"""VM-only end-to-end test: real sandbox-game --net launches, with no pause.
 
 Run as the ordinary VM user, with run-in-sandbox checked out at --sandbox. The
-program in the sandbox waits until the observer has attached from outside, by
-polling a read-only directory; attaching is a manual stand-in for integration.
+observer starts first and is told nothing. Two sandboxes then start at once, each
+with its own wineserver and pasta, and race to one destination.
 """
 import argparse
 import json
@@ -19,23 +19,25 @@ HOST = '198.18.77.1'
 PIN = '/sys/fs/bpf/wine-sandbox-test'
 REDIR = 17892
 MARK = 6666
+PROGRAMS = (('alpha', 'DIRECT'), ('beta', 'REJECT'))
 
 p = argparse.ArgumentParser()
 p.add_argument('--sandbox', required=True, type=Path)
-p.add_argument('--runner', required=True, type=Path, help='a Wine install; wineserver needs DWARF')
+p.add_argument('--runner', required=True, type=Path, help='directory holding wine and wineserver')
 p.add_argument('--observer', required=True, type=Path)
 p.add_argument('--mihomo', required=True, type=Path)
 p.add_argument('--work', required=True, type=Path)
-p.add_argument('--pe', action='store_true', help='build native PE probes with mingw')
+p.add_argument('--bits', type=int, default=64, choices=(32, 64), help='mingw PE probes')
 a = p.parse_args()
 for name in ('sandbox', 'runner', 'observer', 'mihomo', 'work'):
     setattr(a, name, getattr(a, name).resolve())
 a.work.mkdir(parents=True, exist_ok=True)
 source = Path(__file__).resolve().parent
-game, control, proton = a.work / 'game', a.work / 'control', a.work / 'proton'
-name = 'wineroute'
+proton = a.work / 'proton'
+compiler = {32: 'i686-w64-mingw32-gcc', 64: 'x86_64-w64-mingw32-gcc'}[a.bits]
 root = []
-sandbox = None
+sandboxes = {}
+echo = None
 
 
 def sudo(*args, **kwargs):
@@ -44,15 +46,6 @@ def sudo(*args, **kwargs):
 
 def sudo_ls(path):
     return subprocess.run(['sudo', '-n', 'ls', path], capture_output=True, text=True, check=True).stdout.split()
-
-
-def ns(pid):
-    return subprocess.run(['sudo', '-n', 'readlink', f'/proc/{pid}/ns/net'], capture_output=True, text=True).stdout.strip()
-
-
-def pgrep(*args):
-    r = subprocess.run(['pgrep', *args], capture_output=True, text=True)
-    return [int(x) for x in r.stdout.split()]
 
 
 # scope host keeps it out of the addresses sandbox-game refuses.
@@ -67,39 +60,25 @@ sudo('nft', '-f', '-', input=f'''table inet wine_sandbox_test {{
 }}
 ''', text=True)
 try:
-    game.mkdir(exist_ok=True)
-    control.mkdir(exist_ok=True)
     (proton / 'files').mkdir(parents=True, exist_ok=True)
     shutil.copytree(a.runner.parent, proton / 'files', dirs_exist_ok=True, symlinks=True)
     (proton / 'proton').write_text('#!/bin/sh\nexit 0\n')
     (proton / 'proton').chmod(0o755)
     (proton / 'version').write_text('1 wineroute\n')
-    for probe in ('alpha', 'beta'):
-        if a.pe:
-            subprocess.run(['x86_64-w64-mingw32-gcc', '-O1', '-o', game / (probe + '.exe'),
-                            source / 'winsock-probe.c', '-lws2_32', '-lmswsock', '-static'], check=True)
-        else:
-            subprocess.run([a.runner / 'winegcc', '-m64', '-o', game / (probe + '.exe'),
-                            source / 'winsock-probe.c', '-lws2_32'], cwd=game, check=True)
-    suffix = '' if a.pe else '.so'
-    (game / 'run.sh').write_text(f'''#!/bin/sh
+    for probe, _ in PROGRAMS:
+        game = a.work / probe
+        game.mkdir(exist_ok=True)
+        subprocess.run([compiler, '-O1', '-o', game / (probe + '.exe'), source / 'winsock-probe.c',
+                        '-lws2_32', '-lmswsock', '-static'], check=True)
+        (game / 'run.sh').write_text(f'''#!/bin/sh
 export WINEPREFIX=/tmp/prefix WINEDEBUG=-all WINEDLLOVERRIDES='winemenubuilder.exe=d;mscoree,mshtml='
+export PROBE_HOST={HOST}
 W=/proton/files/bin
-timeout 60 $W/wineboot -u
-$W/wineserver -k
-$W/wineserver -p
-sleep .5
-echo prefix-ready
-until [ -e /control/go ]; do sleep .1; done
-for p in alpha beta; do
-    PROBE_HOST={HOST} timeout 40 $W/wine /game/$p.exe{suffix} > /tmp/$p.log 2>&1
-    echo "$p status=$?"; cat /tmp/$p.log
-done
+timeout 90 $W/wine /game/{probe}.exe > /tmp/out.log 2>&1
+echo "status=$?"; cat /tmp/out.log
 $W/wineserver -k
 ''')
-    (game / 'run.sh').chmod(0o755)
-    with (a.work / 'profile.json').open('w') as f:
-        subprocess.run([a.observer, '-make-profile', a.runner / 'wineserver'], stdout=f, check=True)
+        (game / 'run.sh').chmod(0o755)
 
     (a.work / 'mihomo').mkdir(exist_ok=True)
     (a.work / 'mihomo' / 'config.yaml').write_text(f'''redir-port: {REDIR}
@@ -120,34 +99,8 @@ rules:
     root.append(mihomo)
     echo = subprocess.Popen(['python3', str(source / 'echo-server.py'), HOST],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(.5)
-
-    sandbox = subprocess.Popen([str(a.sandbox / 'sandbox-game'), '--headless', '--net', '--name', name,
-                                f'--with-proton={proton}', '--ro', str(control), '/control',
-                                str(game), '/game/run.sh'],
-                               stdout=(a.work / 'sandbox.log').open('w'), stderr=subprocess.STDOUT)
-    server = pasta = None
-    deadline = time.time() + 120
-    while time.time() < deadline and not (server and pasta):
-        assert sandbox.poll() is None, 'sandbox ended early; see sandbox.log'
-        if 'prefix-ready' not in (a.work / 'sandbox.log').read_text():
-            time.sleep(.1)
-            continue
-        pasta = next(iter(pgrep('-u', str(os.getuid()), '-f', f'{name}-pasta')), None)
-        if pasta:
-            inner = subprocess.run(['sudo', '-n', 'sh', '-c', f'readlink /proc/{pasta}/fd/* | grep "^net:"'],
-                                   capture_output=True, text=True).stdout.split()
-            for pid in pgrep('-u', str(os.getuid()), '-x', 'wineserver'):
-                if ns(pid) in inner:
-                    server = pid
-        time.sleep(.1)
-    assert server and pasta, 'wineserver or pasta not found'
-    print('wineserver', server, 'pasta', pasta, flush=True)
-
     records = []
-    observer = subprocess.Popen(['sudo', '-n', str(a.observer), '-pid', str(server),
-                                 '-profile', str(a.work / 'profile.json'),
-                                 '-pasta-pid', str(pasta), '-pin', PIN],
+    observer = subprocess.Popen(['sudo', '-n', str(a.observer), '-pin', PIN],
                                 stdout=subprocess.PIPE, stderr=(a.work / 'observer-stderr.log').open('w'), text=True)
     root.append(observer)
     ready = threading.Event()
@@ -160,36 +113,60 @@ rules:
                 records.append(json.loads(line))
                 if records[-1]['type'] == 'ready':
                     ready.set()
-    threading.Thread(target=collect, daemon=True).start()
+    reader = threading.Thread(target=collect, daemon=True)
+    reader.start()
     assert ready.wait(10), 'observer not ready: ' + (a.work / 'observer-stderr.log').read_text()
-    (control / 'go').touch()
-    sandbox.wait(timeout=120)
-    observer.wait(timeout=15)
-    time.sleep(.3)
-    output = (a.work / 'sandbox.log').read_text()
-    print(output[-1500:], flush=True)
+    time.sleep(.5)
+
+    for probe, _ in PROGRAMS:
+        sandboxes[probe] = subprocess.Popen(
+            [str(a.sandbox / 'sandbox-game'), '--headless', '--net', '--name', 'wineroute-' + probe,
+             f'--with-proton={proton}', str(a.work / probe), '/game/run.sh'],
+            stdout=(a.work / (probe + '.log')).open('w'), stderr=subprocess.STDOUT)
+    for process in sandboxes.values():
+        process.wait(timeout=200)
+    time.sleep(.5)
+
     log = (a.work / 'mihomo.log').read_text()
-    pids = dict(re.findall(r'(alpha|beta) status=\d+\nWindows PID=(\d+)', output))
-    for probe, rule in (('alpha', 'DIRECT'), ('beta', 'REJECT')):
+    print(*re.findall(r'\[TCP\] .*?using \w+', log), sep='\n', flush=True)
+    for probe, rule in PROGRAMS:
+        output = (a.work / (probe + '.log')).read_text()
         exe = probe + '.exe'
+        pid = re.search(r'Windows PID=(\d+)', output)
+        assert pid, output[-800:]
         matches = re.findall(rf'match ProcessName\({exe}\) using {rule}', log)
         relays = [r for r in records if r['type'] == 'relay' and r.get('windows_name') == exe]
         print(exe, 'mihomo matches', len(matches), 'relays', len(relays), flush=True)
         assert len(matches) == 2 and len(relays) == 3
-        assert all(str(r['windows_pid']) == pids[probe] for r in relays), (relays, pids)
-    assert 'ConnectEx recv=14' in output
-    assert any(r.get('reason') == 'target-exit' for r in records)
+        if a.bits == 64:
+            assert all(str(r['windows_pid']) == pid.group(1) for r in relays), (relays, pid.group(1))
+    assert 'ConnectEx recv=14' in (a.work / 'alpha.log').read_text()
+    pastas = {r['pasta_tgid'] for r in records if r['type'] == 'pasta'}
+    servers = {r['server_tgid'] for r in records if r['type'] == 'relay' and r['status'] == 'known'}
+    print('pastas', len(pastas), 'wineservers with traffic', len(servers), flush=True)
+    assert len(pastas) >= 2 and len(servers) == 2
+    unknown = [r for r in records if r['type'] == 'relay' and r['status'] != 'known']
+    print('unknown relays', len(unknown), flush=True)
+    assert not unknown, unknown
+    assert 'wine-unknown' not in log
+    subprocess.run(['sudo', '-n', 'pkill', '-TERM', '-P', str(observer.pid)], check=True)
+    observer.wait(timeout=15)
+    reader.join(timeout=5)
     assert sudo_ls(PIN) == []
-    print('PASS: Windows programs in real sandbox-game routed by name.', flush=True)
+    assert (a.work / 'observer-stderr.log').read_text() == ''
+    print('PASS: two unpaused sandboxes routed by name.', flush=True)
 finally:
-    if sandbox and sandbox.poll() is None:
-        subprocess.run([a.sandbox / 'sandbox-game', '--stop', name], check=False)
-        sandbox.wait(timeout=20)
+    for probe, process in sandboxes.items():
+        if process.poll() is None:
+            subprocess.run([a.sandbox / 'sandbox-game', '--stop', 'wineroute-' + probe], check=False)
+            process.wait(timeout=20)
     for process in root:
         if process.poll() is None:
             subprocess.run(['sudo', '-n', 'pkill', '-TERM', '-P', str(process.pid)], check=False)
             process.wait(timeout=8)
-    subprocess.run(['pkill', '-f', 'echo-server.py'], check=False)
+    if echo:
+        echo.terminate()
+        echo.wait(timeout=5)
     subprocess.run(['sudo', '-n', 'nft', 'delete', 'table', 'inet', 'wine_sandbox_test'], check=False)
     subprocess.run(['sudo', '-n', 'ip', 'addr', 'del', HOST + '/32', 'dev', 'lo'], check=False)
     subprocess.run(['sudo', '-n', 'rm', '-rf', PIN], check=False)

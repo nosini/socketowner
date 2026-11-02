@@ -337,6 +337,12 @@ relay joins a pasta socket to the inner flow from kernel hooks alone, and mihomo
 reads a separate versioned map. See the [observer README](../README.md#how-the-relay-works)
 and the [routing validation](../validation/routing/README.md).
 
+## Implementation milestone: no profiles
+
+A third milestone replaced the build profile. The server's memory is no longer read:
+the request pipe identifies the client, and the client's public PEB names it. See
+the [observer README](../README.md#how-capture-works).
+
 ## Source links
 
 [sandbox-net]: https://github.com/nosini/run-in-sandbox/blob/18efb491689f211ec19a27da67340c7941e33141/sandbox-game#L2080

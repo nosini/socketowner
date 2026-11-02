@@ -1,0 +1,4 @@
+"[TCP] 198.18.77.1:51470(beta.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(beta.exe) using REJECT"
+"[TCP] 198.18.77.1:51456(alpha.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(alpha.exe) using DIRECT"
+"[TCP] 198.18.77.1:51488(beta.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(beta.exe) using REJECT"
+"[TCP] 198.18.77.1:51500(alpha.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(alpha.exe) using DIRECT"

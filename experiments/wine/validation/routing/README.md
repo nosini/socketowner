@@ -1,5 +1,7 @@
 # Routing validation, 2026-11-02
 
+**Historical.** This report predates profile-free capture, and its observer was started per sandbox. See [always-on validation](../always-on/README.md).
+
 This covers the [routing maps and relay](../../README.md#routing-maps) with real
 programs in the dedicated x86-64 VM: kernel `7.2.8-1-default`, BPF LSM, pasta
 `20260612.a9c61ff-1.3`, and the unchanged DW 11.0-15-based runner from the

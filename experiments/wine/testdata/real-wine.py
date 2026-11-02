@@ -42,8 +42,6 @@ try:
     for name in ['alpha', 'beta']:
         command([a.runner / 'winegcc', '-m64', '-o', name+'.exe',
                  source / 'winsock-probe.c', '-lws2_32'])
-    with (a.work / 'profile.json').open('w') as f:
-        command([a.observer, '-make-profile', a.runner / 'wineserver'], stdout=f)
     # Prefix initialization is setup, not a networking assertion. Some Wine
     # builds leave boot services waiting; stop the task-only server afterwards.
     with (a.work / 'prefix-init.log').open('w') as f:
@@ -70,8 +68,7 @@ try:
     if server.poll() is not None or echo.poll() is not None:
         raise RuntimeError('task-only wineserver or echo listener failed')
     stderr = (a.work / 'observer-stderr.log').open('w')
-    observer = subprocess.Popen(['sudo', '-n', str(a.observer), '-pid', str(server.pid),
-                                 '-profile', str(a.work / 'profile.json'), '-sends'],
+    observer = subprocess.Popen(['sudo', '-n', str(a.observer), '-sends'],
                                 stdout=subprocess.PIPE, stderr=stderr, text=True)
     records = []
     ready = threading.Event()
@@ -100,10 +97,11 @@ try:
         if 'WSARecv=-1 error=997' not in output or 'ConnectEx recv=14' not in output:
             raise RuntimeError('probe did not cover pending receive and ConnectEx')
     wine_stop()
+    subprocess.run(['sudo', '-n', 'pkill', '-TERM', '-P', str(observer.pid)], check=True)
     observer.wait(timeout=10)
     reader.join(timeout=10)
     if observer.returncode or reader.is_alive():
-        raise RuntimeError('observer failed or did not stop after target exit')
+        raise RuntimeError('observer failed or did not stop')
     for name, pid in expected.items():
         rows = [r for r in records if r.get('windows_name') == name]
         creates = [r for r in rows if r['type'] == 'create']
@@ -116,18 +114,14 @@ try:
         assert all(r['tcp_flags'] & 2 for r in outgoing if r['network'] == 'tcp')
         assert sum(r['network'] == 'udp' for r in outgoing) == 1
         print(name, 'Windows PID', pid, 'PASS: 3 creations and 3 attributed first packets', flush=True)
-    assert any(r['type'] == 'stopped' and r.get('reason') == 'target-exit' for r in records)
+    assert any(r['type'] == 'stopped' and r.get('reason') == 'cancelled' for r in records)
     assert (a.work / 'observer-stderr.log').read_text() == ''
     print('PASS: unchanged Wine, two Windows images, TCP SYN + unconnected UDP, clean observer exit.', flush=True)
 finally:
     wine_stop()
     if observer is not None and observer.poll() is None:
-        # Target exit should stop it even if startup/one assertion failed.
-        try:
-            observer.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            subprocess.run(['sudo', '-n', 'kill', '-TERM', str(observer.pid)], check=False)
-            observer.wait(timeout=5)
+        subprocess.run(['sudo', '-n', 'pkill', '-TERM', '-P', str(observer.pid)], check=False)
+        observer.wait(timeout=5)
     for proc in reversed(processes):
         if proc.poll() is None:
             proc.terminate()

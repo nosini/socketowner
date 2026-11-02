@@ -15,3 +15,6 @@ The archived scripts retain their original VM paths and build assumptions;
 they are evidence of the recorded runs. Use the observer README and its
 `testdata/` harnesses for current reproduction commands. The archived
 `winsock-probe.c` and `echo-server.py` match the copies reused in `../testdata/`.
+
+[Build-independent capture](generic-capture/README.md) records the prototype which
+replaced per-build profiles.

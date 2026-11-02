@@ -46,6 +46,10 @@ def sudo(*args, **kwargs):
     return subprocess.run(['sudo', '-n', *map(str, args)], check=True, **kwargs)
 
 
+def sudo_ls(path):
+    return subprocess.run(['sudo', '-n', 'ls', path], capture_output=True, text=True, check=True).stdout.split()
+
+
 def background(args, log, **kwargs):
     f = (a.work / log).open('w')
     process = subprocess.Popen([str(x) for x in args], cwd=a.work, stdout=f, stderr=f, **kwargs)
@@ -78,8 +82,6 @@ try:
     for name in ('alpha', 'beta', 'gamma'):
         subprocess.run([a.runner / 'winegcc', '-m64', '-o', name + '.exe',
                         source / 'winsock-probe.c', '-lws2_32'], cwd=a.work, check=True)
-    with (a.work / 'profile.json').open('w') as f:
-        subprocess.run([a.observer, '-make-profile', a.runner / 'wineserver'], stdout=f, check=True)
     with (a.work / 'prefix-init.log').open('w') as f:
         boot = subprocess.Popen([str(a.runner / 'wineboot'), '-u'], env=env, cwd=a.work, stdout=f, stderr=f)
         try:
@@ -133,17 +135,11 @@ rules:
     pasta = int(pasta_pidfile.read_text())
     os.unlink(pasta_pidfile)
 
-    server = background([*enter, a.runner / 'wineserver', '-f', '-p'], 'server.log', env=env)
-    processes.append(server)
-    time.sleep(.5)
-    assert server.poll() is None, 'wineserver failed'
-
     records = []
 
     def start_observer():
-        relay = [] if a.control else ['-pasta-pid', str(pasta)]
-        observer = subprocess.Popen(['sudo', '-n', str(a.observer), '-pid', str(server.pid),
-                                     '-profile', str(a.work / 'profile.json'), *relay, '-pin', PIN],
+        relay = ['-no-relay'] if a.control else []
+        observer = subprocess.Popen(['sudo', '-n', str(a.observer), *relay, '-pin', PIN],
                                     stdout=subprocess.PIPE, stderr=(a.work / 'observer-stderr.log').open('a'), text=True)
         root_processes.append(observer)
         ready = threading.Event()
@@ -162,7 +158,13 @@ rules:
         assert ready.wait(10), 'observer did not become ready; see observer-stderr.log'
         return observer, reader
 
+    # Before any wineserver exists: nothing tells the observer about it.
     observer, reader = start_observer()
+    server = background([*enter, a.runner / 'wineserver', '-f', '-p'], 'server.log', env=env)
+    processes.append(server)
+    time.sleep(.5)
+    assert server.poll() is None, 'wineserver failed'
+
 
     def wine(name, background_run=False):
         out = (a.work / (name + '-stdout.log')).open('w')
@@ -197,7 +199,7 @@ rules:
     subprocess.run(['sudo', '-n', 'pkill', '-KILL', '-P', str(observer.pid)], check=True)
     observer.wait(timeout=5)
     reader.join(timeout=5)
-    pins = subprocess.run(['sudo', '-n', 'ls', PIN], capture_output=True, text=True, check=True).stdout.split()
+    pins = sudo_ls(PIN)
     assert 'wine_flows' in pins, pins
     time.sleep(6)
     observer, reader = start_observer()
@@ -229,7 +231,7 @@ rules:
         gamma.wait()
     assert racing, 'gamma never sent its first SYN'
 
-    pins = subprocess.run(['sudo', '-n', 'ls', PIN], capture_output=True, text=True, check=True).stdout.split()
+    pins = sudo_ls(PIN)
     assert sorted(pins) == ['wine_abi', 'wine_flows', 'wine_heartbeat'], pins
     time.sleep(.5)
 
@@ -259,10 +261,11 @@ rules:
     # ---- lifecycle ----------------------------------------------------------
     subprocess.run([*enter, a.runner / 'wineserver', '-k'], env=env, timeout=10)
     server.wait(timeout=10)
-    observer.wait(timeout=10)
+    assert sudo_ls(PIN) != [], 'observer outlives its wineservers'
+    stop_root(observer)
     reader.join(timeout=10)
-    assert any(r['type'] == 'stopped' and r.get('reason') == 'target-exit' for r in records)
-    pins = subprocess.run(['sudo', '-n', 'ls', PIN], capture_output=True, text=True, check=True).stdout.split()
+    assert any(r['type'] == 'stopped' and r.get('reason') == 'cancelled' for r in records)
+    pins = sudo_ls(PIN)
     assert pins == [], pins
     assert (a.work / 'observer-stderr.log').read_text() == ''
     assert not re.search(r'level=(error|fatal)', (a.work / 'mihomo.log').read_text())
