@@ -3,13 +3,16 @@
 This optional command identifies the Windows program which creates an outgoing
 TCP/UDP socket in an unchanged, explicitly selected wineserver. It prints JSON
 diagnostics for socket creation, connect attempts and the first outgoing packet.
-No Wine patch, injected DLL, uprobe, TLS adapter or sandbox capability is needed.
+With `-pin` it publishes those identities for mihomo's `PROCESS-NAME` and
+`PROCESS-PATH` rules, and with `-pasta-pid` they survive a sandbox's pasta.
+No Wine or pasta patch, injected DLL, uprobe, TLS adapter or sandbox capability
+is needed.
 
-This is the first implementation milestone. It does **not** publish a routing
-interface, change native socketowner maps, map pasta's replacement sockets, or
-enable mihomo rules. Do not use the diagnostic event stream as a routing
-authority. Unsupported binaries are refused; unreadable or incomplete Windows
-metadata is reported without an executable name.
+This remains an experiment, started by hand for one sandbox; see
+[what is missing](#what-is-missing). It leaves native socketowner maps unchanged.
+Do not use the diagnostic event stream as a routing authority: readers use the
+pinned [routing maps](#routing-maps). Unsupported binaries are refused;
+unreadable or incomplete Windows metadata is reported without an executable name.
 
 ## Build and run
 
@@ -46,10 +49,14 @@ the cgroup v2 ancestor used for first-packet observation; its default is
 which use its FDs. The LSM hooks are globally attached but accept metadata only
 from the registered task and observe only its labelled sockets.
 
+Add `-pasta-pid PID` for the sandbox's pasta, and `-pin DIR` with
+`-reader-group GROUP` to publish [routing maps](#routing-maps).
+
 Wait for the `ready` event before launching the program. Sockets which already
-existed when observation started remain unlabelled. Stop with Ctrl-C. Target
-exit stops the observer; target exec revokes registration. Nothing is pinned,
-installed or left attached after the command exits or crashes.
+existed when observation started remain unlabelled. Stop with Ctrl-C. Target or
+pasta exit stops the observer; exec revokes registration. Nothing stays attached
+after the command exits or crashes. Pins are removed on exit; a crash leaves them
+until the next publisher.
 
 The observer needs host BPF/LSM/iterator and cgroup attachment privileges, and
 permission to inspect the selected process's executable and mappings. Depending
@@ -75,6 +82,8 @@ not a complete flow table. Packet/header parsing is limited to TCP/UDP,
 IPv4 with options and up to eight supported IPv6 extension headers;
 noninitial fragments and unsupported protocols are omitted.
 
+`relay` reports a pasta socket joined to its inner flow, or its unknown status.
+
 The identity describes the **Windows socket creator**. It is immutable after
 creation. A subsequent connect attempt, failed connect, or send through a
 duplicated/inherited FD does not replace it with the requesting process. The
@@ -92,6 +101,91 @@ count; short-lived/late-attached sockets, shutdown and unsupported packet paths
 can also leave incomplete diagnostics. Records retained by an external log
 reader have no continuing authority after the observer exits. A future routing
 reader needs its own lifecycle, publication and unknown-result contract.
+
+## Routing maps
+
+`-pin DIR`, normally socketowner's `maps` directory, adds three optional pins
+beside its ABI v1 maps. V1 records are unchanged, so no v1 version change applies.
+These have their own version, and their pins come and go with the observer:
+
+| Pin | Linux map type | Key bytes | Value bytes | Meaning |
+| --- | --- | ---: | ---: | --- |
+| `wine_abi` | `ARRAY` (2) | 4 | 4 | Frozen; key 0 holds version 1 |
+| `wine_heartbeat` | `ARRAY` (2) | 4 | 8 | Key 0 holds `CLOCK_BOOTTIME` nanoseconds, updated every second |
+| `wine_flows` | `LRU_HASH` (9) | 32 | 1088 | Identity by outgoing packet source |
+
+`wine_flows` is pinned last and is the publication point. Its key is the v1
+connection key. All integers are native endian. The value is:
+
+| Byte offset | Type | Meaning |
+| ---: | --- | --- |
+| 0 | uint64 | Socket ID, unique within one observer lifetime; not `SO_COOKIE` |
+| 8 | uint64 | wineserver start, `CLOCK_BOOTTIME` nanoseconds |
+| 16 | uint64 | Windows process start time, as wineserver records it |
+| 24 | uint64 | `CLOCK_BOOTTIME` nanoseconds at capture |
+| 32 | uint32 | wineserver host TGID |
+| 36 | uint32 | UID of the capturing process |
+| 40 | uint32 | Windows PID |
+| 44 | uint32 | Client Unix PID, in wineserver's PID namespace |
+| 48 | uint32 | Status; only 1 names a program |
+| 52 | uint32 | Image length in bytes |
+| 56 | uint32 | IP protocol |
+| 60 | uint32 | Padding |
+| 64 | uint16[512] | Windows image, UTF-16, not NUL terminated |
+
+Status 1 is known. 2-5 are the capture failures listed above. 6 means owners
+differed while waiting for pasta, 7 that pasta's socket matched no inner flow,
+and 8 that the inner flow came from a socket with no Windows identity.
+
+The kernel writes a record before the packet it describes leaves `wine_egress`,
+so it precedes mihomo's first lookup; it does not depend on the event buffer.
+An unlabelled socket which sends from a recorded address and port removes the
+record. Active flows republish after LRU eviction. A reader must:
+
+1. Check the version, map types and sizes before any lookup, as for v1.
+2. Consult `wine_flows` first. No record means ordinary lookup proceeds.
+3. Treat a record with another status, a heartbeat older than five seconds, or an
+   image failing validation as **unknown**, not as absent. Falling through would
+   name the relay, or whichever process now holds a reused port.
+
+mihomo reports unknown as the process `wine-unknown`, so that a deny can be
+written for it:
+
+```yaml
+rules:
+  - PROCESS-NAME,tbs_browser.exe,REJECT
+  - PROCESS-NAME,wine-unknown,REJECT
+```
+
+A crash leaves the pins, which a new publisher replaces once the heartbeat has
+expired. While no observer runs, new flows have no record and show as pasta.
+A rule for the sandbox's pasta name can decide what those may do.
+
+## How the relay works
+
+pasta opens a host socket for each flow it reads from its TAP, so mihomo sees
+pasta, with a TCP source port unrelated to the inner one. pasta can't be asked
+which flow a socket serves, but the kernel sees both sides in order:
+
+1. `wine_egress` sees each new inner flow in the sandbox's namespace before it
+   can reach the TAP, and records its owner in `relay_flows`. That includes
+   flows from unlabelled sockets.
+2. pasta connects its replacement socket from its one socket-handling thread.
+   `lsm/socket_connect` finds the record and copies the identity to that socket.
+3. `wine_egress` then publishes it under the host packet's actual source.
+
+UDP's key includes the source port, which pasta preserves, so it is exact and
+covers each peer of an unconnected socket. A TCP replacement socket can't see the
+inner port, so concurrent flows to one destination share a record. If they share
+an owner the result is the same whichever connect comes first. If not, all of
+them are ambiguous and stay unknown: waiting flows are never paired by arrival
+order. Records older than two seconds are ignored.
+
+`-pasta-pid` is refused unless that process holds a descriptor for the target's
+network namespace. Registration is keyed by pidfd and revoked on exec. No pasta
+memory is read, so pasta needs no profile and its updates don't affect one.
+The relay inherits the Wine trust limit below, and a sandboxed program can
+provoke unknown results by racing another program to one destination.
 
 ## How registration works
 
@@ -158,6 +252,15 @@ failed-connect creator preservation, a fork sending through an inherited socket,
 an unregistered fork creating its own socket, malformed/oversized/absent request
 data, repeated FD reuse, observer restart, target exit and exec revocation.
 
+The [routing test](validation/routing/README.md) runs the same way, with real
+pasta, mihomo and nftables around Wine:
+
+```sh
+python3 experiments/wine/testdata/pasta-route.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/route
+```
+
+`--control` repeats it without the relay, where no rule may see a Windows name.
+
 A separate real-Wine smoke test runs as the ordinary VM user. Only its observer
 uses sudo. It requires the existing Wine runner's compiler and writes only to
 the supplied task directory:
@@ -172,8 +275,22 @@ ordinary TCP, ConnectEx TCP, and UDP sendto before connect. The probes also
 complete a pending overlapped receive and connected UDP. It verifies the
 Windows PID against each probe's own output and target-exit cleanup.
 
-The tested real runner was an unchanged existing DW 11.0-15-based build. This
-does not establish NIKKE, all packaged DW builds, native PE/WOW64, complete
-Windows firewall semantics, multiple server registration, packet-loss behavior
-under load, or the pasta/mihomo stages. The next stage is a versioned routing
-reader with lifecycle/publication guarantees, followed by the pasta relation.
+The tested real runner was an unchanged existing DW 11.0-15-based build.
+
+## What is missing
+
+- **Launch integration.** The observer needs the wineserver and pasta PIDs, and
+  must be ready before the program's first socket. Nothing automates that yet,
+  and an earlier socket stays unlabelled.
+- **Several sandboxes.** One observer serves one wineserver and one pasta, and
+  one publisher may use a pin directory. A second sandbox is refused.
+- **Deployment.** No service unit, SELinux policy or reader-group setup exists.
+- **Untested:** NIKKE, real Wine in bwrap/run-in-sandbox, native PE/WOW64, IPv6
+  through the relay, UDP through a mihomo inbound (only its published record was
+  checked), other DW builds, and load. The per-packet cost of `wine_egress`,
+  which now parses every packet on the host, has not been measured.
+- **DNS.** Flows sent to pasta's `--dns-forward` address are translated, so they
+  find no inner record and will be unknown. A rule refusing `wine-unknown` should
+  exempt them. Reasoned from pasta's source, not tested.
+- **UDP reuse.** A new inner socket reusing a live UDP 4-tuple inherits pasta's
+  existing flow, and with it the previous owner until that flow expires.

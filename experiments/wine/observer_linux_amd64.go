@@ -26,11 +26,18 @@ var object []byte
 type Options struct {
 	Cgroup string
 	Sends  bool
+	// Pasta joins that process's replacement sockets to this target's flows.
+	Pasta *Pasta
+	// Pin publishes the routing maps in this directory; see publish_linux_amd64.go.
+	Pin string
+	// Group is given read access to the pins, or -1 for the observer's own.
+	Group int
 }
 
-// Observe owns every FD/link and pins nothing. The callback's ready event is
-// emitted only after registration, hook attachment and target revalidation.
-// Stop/exit closes the BPF attachments; no persistent host state is installed.
+// Observe owns every FD/link. The callback's ready event is emitted only after
+// registration, hook attachment and target revalidation. Stop/exit closes the
+// BPF attachments. Only an explicit Pin leaves anything behind after a crash,
+// and its heartbeat tells readers that those records have gone stale.
 func Observe(ctx context.Context, t *Target, options Options, consume func(Event) error) error {
 	if t == nil || t.pidfd < 0 || t.exe == nil || options.Cgroup == "" || consume == nil {
 		return errors.New("prepared Wine target, explicit cgroup and event consumer required")
@@ -64,9 +71,6 @@ func Observe(ctx context.Context, t *Target, options Options, consume func(Event
 	if err := coll.Maps["wine_targets"].Update(int32(t.pidfd), config, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("register Wine task storage: %w", err)
 	}
-	if err := coll.Maps["wine_targets"].Freeze(); err != nil {
-		return fmt.Errorf("freeze Wine registration: %w", err)
-	}
 	var links []link.Link
 	defer func() {
 		for i := len(links) - 1; i >= 0; i-- {
@@ -98,8 +102,16 @@ func Observe(ctx context.Context, t *Target, options Options, consume func(Event
 	if err != nil {
 		return fmt.Errorf("seed Wine executable identity: %w", err)
 	}
-	if err := coll.Maps["wine_targets"].Lookup(int32(t.pidfd), &config); err != nil || config.Active != 1 || config.KernelExe == 0 {
+	if err := coll.Maps["wine_targets"].Lookup(int32(t.pidfd), &config); err != nil || config.Active != 1 || config.KernelExe == 0 || config.NetNS == 0 {
 		return errors.New("could not seed the selected Wine executable")
+	}
+	if err := coll.Maps["wine_targets"].Freeze(); err != nil {
+		return fmt.Errorf("freeze Wine registration: %w", err)
+	}
+	if options.Pasta != nil {
+		if err := options.Pasta.register(coll, config.NetNS); err != nil {
+			return err
+		}
 	}
 	rd, err := ringbuf.NewReader(coll.Maps["events"])
 	if err != nil {
@@ -108,6 +120,13 @@ func Observe(ctx context.Context, t *Target, options Options, consume func(Event
 	defer rd.Close()
 	if err := t.recheck(); err != nil {
 		return err
+	}
+	var published *publication
+	if options.Pin != "" {
+		if published, err = publish(coll, options.Pin, options.Group); err != nil {
+			return err
+		}
+		defer published.close()
 	}
 	if err := consume(Event{Type: "ready", Profile: t.Profile.ID, ServerTGID: uint32(t.PID)}); err != nil {
 		return err
@@ -123,6 +142,17 @@ func Observe(ctx context.Context, t *Target, options Options, consume func(Event
 		}
 		if !alive {
 			return consume(Event{Type: "stopped", Reason: "target-exit"})
+		}
+		if options.Pasta != nil {
+			if alive, err = options.Pasta.alive(); err != nil {
+				return err
+			}
+			if !alive {
+				return consume(Event{Type: "stopped", Reason: "pasta-exit"})
+			}
+		}
+		if err := published.beat(); err != nil {
+			return err
 		}
 		if err := coll.Maps["wine_targets"].Lookup(int32(t.pidfd), &config); err != nil || config.Active != 1 {
 			return errors.New("Wine registration revoked (target exec or observer exhaustion)")

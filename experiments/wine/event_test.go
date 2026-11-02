@@ -86,3 +86,20 @@ func TestDecodeEgress(t *testing.T) {
 		t.Fatal(e.WindowsImage)
 	}
 }
+
+func TestDecodeRelayUnknown(t *testing.T) {
+	var r rawEvent
+	r.Kind = 5
+	r.Owner = rawOwner{SocketID: 9, ServerStartNS: 3, ServerTGID: 7, Status: 6, Protocol: 6}
+	var data bytes.Buffer
+	if err := binary.Write(&data, binary.NativeEndian, r); err != nil {
+		t.Fatal(err)
+	}
+	e, err := decodeEvent(data.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Type != "relay" || e.Status != "ambiguous-relay" || e.WindowsName != "" || e.WindowsImage != "" {
+		t.Fatalf("unexpected relay event: %+v", e)
+	}
+}

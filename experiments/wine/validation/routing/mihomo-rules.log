@@ -1,0 +1,8 @@
+"[TCP] 198.18.77.1:52718(alpha.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(alpha.exe) using DIRECT"
+"[TCP] 198.18.77.1:52740(alpha.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(alpha.exe) using DIRECT"
+"[TCP] 198.18.77.1:52758(beta.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(beta.exe) using REJECT"
+"[TCP] 198.18.77.1:52766(beta.exe, uid=1000) --> 198.18.77.1:30443 match ProcessName(beta.exe) using REJECT"
+"[TCP] 198.18.77.1:52768(wine-unknown, uid=1000) --> 198.18.77.1:30443 match ProcessName(wine-unknown) using REJECT"
+"[TCP] 198.18.77.1:52794(wine-unknown, uid=1000) --> 198.18.77.1:30443 match ProcessName(wine-unknown) using REJECT"
+"[TCP] 198.18.77.1:52778(wine-unknown, uid=1000) --> 198.18.77.1:30443 match ProcessName(wine-unknown) using REJECT"
+"[TCP] 198.18.77.1:52808(gamma.exe, uid=1000) --> 198.18.77.1:30443 match Match using DIRECT"

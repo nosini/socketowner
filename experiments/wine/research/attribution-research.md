@@ -330,6 +330,13 @@ pasta's replacement-socket relation and mihomo integration remain open. The
 observer is not a routing authority and does not yet make a `tbs_browser.exe`
 rule work. All task-only VM state was cleaned after retaining the evidence.
 
+## Implementation milestone: routing through pasta
+
+A second milestone removed the need for the pasta patch recommended above. The
+relay joins a pasta socket to the inner flow from kernel hooks alone, and mihomo
+reads a separate versioned map. See the [observer README](../README.md#how-the-relay-works)
+and the [routing validation](../validation/routing/README.md).
+
 ## Source links
 
 [sandbox-net]: https://github.com/nosini/run-in-sandbox/blob/18efb491689f211ec19a27da67340c7941e33141/sandbox-game#L2080

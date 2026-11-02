@@ -1,7 +1,12 @@
-// Optional diagnostic Wine adapter. No native socketowner map is replaced.
+// Optional Wine adapter. No native socketowner map is replaced.
 // Only a pidfd-registered task with a matching executable may supply metadata.
 // Creator records are immutable after socket_post_create returns: a failed
 // connect or a different sender must not rewrite a socket's creator.
+//
+// A registered pasta carries a sandbox's traffic out through replacement
+// sockets. Its connect joins each one to the inner flow which caused it. The
+// inner packet is seen before it reaches pasta's TAP, so the record exists by
+// then, and wine_flows is written before the host packet reaches mihomo.
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -13,18 +18,33 @@
 #define INVALID_IMAGE 3
 #define CHANGED_REQUEST 4
 #define INVALID_PROCESS 5
+#define AMBIGUOUS_RELAY 6
+#define NO_INNER_FLOW 7
+#define NOT_WINE 8
+// pasta handles a SYN as soon as it reads the TAP; older records are leftovers.
+#define RELAY_TTL_NS 2000000000ULL
 
 struct inode { unsigned long i_ino; } __attribute__((preserve_access_index));
 struct file { struct inode *f_inode; } __attribute__((preserve_access_index));
 struct mm_struct { struct file *exe_file; } __attribute__((preserve_access_index));
+struct net { __u64 net_cookie; } __attribute__((preserve_access_index));
+struct nsproxy { struct net *net_ns; } __attribute__((preserve_access_index));
 struct task_struct {
 	struct task_struct *group_leader;
 	struct mm_struct *mm;
+	struct nsproxy *nsproxy;
 	__u64 start_boottime;
 } __attribute__((preserve_access_index));
-struct sock {};
-struct socket { struct sock *sk; } __attribute__((preserve_access_index));
+struct sock_common { unsigned short skc_num; } __attribute__((preserve_access_index));
+struct sock { struct sock_common __sk_common; } __attribute__((preserve_access_index));
+struct socket { short type; struct sock *sk; } __attribute__((preserve_access_index));
 struct sockaddr { __u16 family, port; };
+struct address {
+	__u16 family;
+	__be16 port;
+	__u32 v4_or_flow;
+	__u8 v6[16];
+};
 struct msghdr;
 struct linux_binprm;
 struct bpf_iter_meta;
@@ -34,7 +54,7 @@ struct bpf_iter__task {
 };
 
 struct target_config {
-	__u64 current_address, exe_inode, kernel_exe;
+	__u64 current_address, exe_inode, kernel_exe, netns;
 	__u32 thread_process, process_id, process_unix_pid;
 	__u32 process_start, process_img_len, process_image, active, sends;
 };
@@ -48,6 +68,28 @@ struct storage {
 	struct owner owner;
 	__u32 ready, first_egress;
 	__u32 sends, pad;
+	// Used only in relay_flows, whose values are copies of this record.
+	__u64 seen_ns;
+	__u32 count, ambiguous;
+};
+struct pasta_target {
+	__u64 netns;
+	__u32 active, pad;
+};
+struct conn_key {
+	__u64 netns;
+	__u8 address[16];
+	__u16 port;
+	__u8 protocol, pad[5];
+};
+// TCP has no source port here: pasta's replacement socket does not know the
+// inner one. Everything waiting for one destination shares a record, and
+// mixed owners make it ambiguous rather than a guess by arrival order.
+struct relay_key {
+	__u64 netns;
+	__u8 destination[16];
+	__u16 destination_port, source_port;
+	__u8 protocol, pad[3];
 };
 struct flow {
 	__u64 netns;
@@ -73,6 +115,41 @@ struct {
 	__type(key, int);
 	__type(value, struct storage);
 } wine_sockets SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct pasta_target);
+} pasta_targets SEC(".maps");
+// Public; see docs in ../README.md. Written from the socket record itself, so
+// the routing path does not depend on the diagnostic ring buffer.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct conn_key);
+	__type(value, struct owner);
+} wine_flows SEC(".maps");
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct relay_key);
+	__type(value, struct storage);
+} relay_flows SEC(".maps");
+// An all-zero record: the update helper needs its value in map or stack memory,
+// and this one is too large for the stack.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct storage);
+} unlabelled SEC(".maps");
+// Slot 0 is the sandbox's network namespace cookie, or 0 with no pasta.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} relay_netns SEC(".maps");
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 20);
@@ -114,6 +191,7 @@ int wine_seed(struct bpf_iter__task *ctx)
 	struct mm_struct *mm;
 	struct file *exe;
 	struct inode *inode;
+	struct nsproxy *ns;
 	if (!task || task->group_leader != task || !(mm = task->mm))
 		return 0;
 	c = bpf_task_storage_get(&wine_targets, task, 0, 0);
@@ -124,6 +202,9 @@ int wine_seed(struct bpf_iter__task *ctx)
 		c->active = 0;
 		return 0;
 	}
+	ns = task->nsproxy;
+	if (ns)
+		c->netns = ns->net_ns->net_cookie;
 	c->kernel_exe = (__u64)exe;
 	return 0;
 }
@@ -228,15 +309,96 @@ int BPF_PROG(wine_create, struct socket *socket, int family, int type, int proto
 	return 0;
 }
 
+static __always_inline __u64 next_socket_id(void)
+{
+	__u32 key = 0;
+	__u64 *seq = bpf_map_lookup_elem(&counters, &key);
+	return seq ? __sync_fetch_and_add(seq, 1) + 1 : 0;
+}
+
+// Each pasta socket joins at most one inner flow. Connect runs in pasta's only
+// socket thread and precedes the first host packet.
+static __always_inline void relay_connect(struct task_struct *task, struct pasta_target *t,
+					  struct socket *socket, struct sock *sk, struct sockaddr *addr)
+{
+	struct relay_key k = {};
+	struct address a = {};
+	struct storage *s, *e;
+	__u64 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u32 status = NO_INNER_FLOW, protocol;
+	int fresh;
+	if (socket->type != 1 && socket->type != 2)
+		return;
+	protocol = socket->type == 1 ? 6 : 17;
+	if (bpf_probe_read_kernel(&a, sizeof(a), addr))
+		return;
+	if (a.family == 2) {
+		k.destination[10] = k.destination[11] = 0xff;
+		__builtin_memcpy(&k.destination[12], &a.v4_or_flow, 4);
+	} else if (a.family == 10) {
+		__builtin_memcpy(k.destination, a.v6, 16);
+	} else {
+		return;
+	}
+	s = bpf_sk_storage_get(&wine_sockets, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+	if (!s || s->ready)
+		return;
+	k.netns = t->netns;
+	k.destination_port = bpf_ntohs(a.port);
+	k.protocol = protocol;
+	if (protocol == 17)
+		k.source_port = sk->__sk_common.skc_num;
+	e = bpf_map_lookup_elem(&relay_flows, &k);
+	if (e) {
+		fresh = protocol == 17 || bpf_ktime_get_boot_ns() - e->seen_ns <= RELAY_TTL_NS;
+		if (!fresh)
+			status = NO_INNER_FLOW;
+		else if (e->ambiguous)
+			status = AMBIGUOUS_RELAY;
+		else if (!e->ready)
+			status = NOT_WINE;
+		else if (bpf_probe_read_kernel(&s->owner, sizeof(s->owner), &e->owner))
+			status = NO_INNER_FLOW;
+		else
+			status = 0;
+		if (protocol == 6 && (!fresh || __sync_fetch_and_add(&e->count, -1) <= 1))
+			bpf_map_delete_elem(&relay_flows, &k);
+	}
+	if (status) {
+		__builtin_memset(&s->owner, 0, sizeof(s->owner));
+		s->owner.socket_id = next_socket_id();
+		s->owner.server_start_ns = task->group_leader->start_boottime;
+		s->owner.captured_boot_ns = bpf_ktime_get_boot_ns();
+		s->owner.server_tgid = tgid;
+		s->owner.uid = bpf_get_current_uid_gid();
+		s->owner.protocol = protocol;
+		s->owner.status = status;
+	}
+	if (!s->owner.socket_id)
+		return;
+	__sync_lock_test_and_set(&s->ready, 1);
+	emit(s, 5, 0);
+}
+
 SEC("lsm/socket_connect")
 int BPF_PROG(wine_connect, struct socket *socket, struct sockaddr *addr, int len, int ret)
 {
+	struct task_struct *task;
+	struct pasta_target *t;
 	struct storage *s;
 	struct sock *sk;
 	if (ret)
 		return ret;
 	sk = socket->sk;
-	if (!sk || !(s = bpf_sk_storage_get(&wine_sockets, sk, 0, 0)) || !s->ready)
+	if (!sk)
+		return 0;
+	task = bpf_get_current_task_btf();
+	t = bpf_task_storage_get(&pasta_targets, task->group_leader, 0, 0);
+	if (t && t->active) {
+		relay_connect(task, t, socket, sk, addr);
+		return 0;
+	}
+	if (!(s = bpf_sk_storage_get(&wine_sockets, sk, 0, 0)) || !s->ready)
 		return 0;
 	// Report the operation, not a successful connection. In particular,
 	// EISCONN from another holder must not reassign the creator identity.
@@ -263,8 +425,11 @@ int BPF_PROG(wine_exec, struct linux_binprm *bprm)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
 	struct target_config *c = bpf_task_storage_get(&wine_targets, task->group_leader, 0, 0);
+	struct pasta_target *t = bpf_task_storage_get(&pasta_targets, task->group_leader, 0, 0);
 	if (c)
 		c->active = 0;
+	if (t)
+		t->active = 0;
 	return 0;
 }
 
@@ -328,17 +493,103 @@ static __always_inline int packet_flow(struct __sk_buff *skb, struct flow *f)
 	return 1;
 }
 
+static __always_inline int same_owner(struct storage *a, struct storage *b)
+{
+	if (!b)
+		return !a->ready;
+	return a->ready && a->owner.status == KNOWN && b->owner.status == KNOWN &&
+	       a->owner.server_tgid == b->owner.server_tgid &&
+	       a->owner.server_start_ns == b->owner.server_start_ns &&
+	       a->owner.windows_pid == b->owner.windows_pid &&
+	       a->owner.windows_start_time == b->owner.windows_start_time;
+}
+
+// Runs before the packet can reach pasta. Unlabelled flows are recorded too: a
+// native program's SYN must not let pasta consume a Windows program's record.
+static __always_inline void note_inner_flow(struct flow *f, struct storage *s)
+{
+	struct relay_key k = {};
+	struct storage *p, *value;
+	__u64 now = bpf_ktime_get_boot_ns();
+	__u32 zero = 0;
+	value = s ? s : bpf_map_lookup_elem(&unlabelled, &zero);
+	if (!value)
+		return;
+	k.netns = f->netns;
+	__builtin_memcpy(k.destination, f->destination, 16);
+	k.destination_port = f->destination_port;
+	k.protocol = f->protocol;
+	if (f->protocol == 17) {
+		// pasta keeps UDP source ports, which makes this key exact; a new
+		// socket on the port replaces its predecessor's record.
+		k.source_port = f->source_port;
+		p = bpf_map_lookup_elem(&relay_flows, &k);
+		if (p && (s ? p->owner.socket_id == s->owner.socket_id : !p->ready))
+			return;
+		bpf_map_update_elem(&relay_flows, &k, value, BPF_ANY);
+		return;
+	}
+	if ((f->tcp_flags & 0x12) != 0x02)
+		return;
+	p = bpf_map_lookup_elem(&relay_flows, &k);
+	if (p && now - p->seen_ns > RELAY_TTL_NS) {
+		bpf_map_delete_elem(&relay_flows, &k);
+		p = 0;
+	}
+	if (!p) {
+		// NOEXIST keeps two CPUs from replacing each other's waiting record.
+		int inserted = !bpf_map_update_elem(&relay_flows, &k, value, BPF_NOEXIST);
+		p = bpf_map_lookup_elem(&relay_flows, &k);
+		if (!p)
+			return;
+		if (inserted) {
+			p->seen_ns = now;
+			__sync_fetch_and_add(&p->count, 1);
+			return;
+		}
+	}
+	if (!same_owner(p, s))
+		p->ambiguous = 1;
+	p->seen_ns = now;
+	__sync_fetch_and_add(&p->count, 1);
+}
+
 SEC("cgroup_skb/egress")
 int wine_egress(struct __sk_buff *skb)
 {
 	struct storage *s;
+	struct owner *published;
+	struct conn_key key = {};
 	struct flow f = {};
 	struct bpf_sock *sk = skb->sk;
-	if (!sk || !(s = bpf_sk_storage_get(&wine_sockets, sk, 0, 0)) || !s->ready)
+	__u32 zero = 0;
+	__u64 *relay;
+	if (!sk)
 		return 1;
-	if (!packet_flow(skb, &f) || __sync_val_compare_and_swap(&s->first_egress, 0, 1))
+	s = bpf_sk_storage_get(&wine_sockets, sk, 0, 0);
+	if (s && !s->ready)
+		s = 0;
+	if (!packet_flow(skb, &f))
 		return 1;
-	emit(s, 4, &f);
+	relay = bpf_map_lookup_elem(&relay_netns, &zero);
+	if (relay && *relay && *relay == f.netns)
+		note_inner_flow(&f, s);
+	key.netns = f.netns;
+	__builtin_memcpy(key.address, f.source, 16);
+	key.port = f.source_port;
+	key.protocol = f.protocol;
+	published = bpf_map_lookup_elem(&wine_flows, &key);
+	if (!s) {
+		// The port passed to a socket with no Windows identity.
+		if (published)
+			bpf_map_delete_elem(&wine_flows, &key);
+		return 1;
+	}
+	// Active flows republish after LRU eviction, as conn_owners does.
+	if (!published || published->socket_id != s->owner.socket_id)
+		bpf_map_update_elem(&wine_flows, &key, &s->owner, BPF_ANY);
+	if (!__sync_val_compare_and_swap(&s->first_egress, 0, 1))
+		emit(s, 4, &f);
 	return 1;
 }
 

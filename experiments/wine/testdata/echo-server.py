@@ -1,6 +1,7 @@
-import socket,threading,time
+import socket,sys,threading,time
+host=sys.argv[1] if len(sys.argv)>1 else '127.0.0.1'
 def tcp():
-    s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',30443));s.listen()
+    s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind((host,30443));s.listen()
     while True:
         c,a=s.accept()
         def echo(c):
@@ -10,7 +11,7 @@ def tcp():
                     c.sendall(data)
         threading.Thread(target=echo,args=(c,),daemon=True).start()
 def udp():
-    s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',30553))
+    s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind((host,30553))
     while True:
         d,a=s.recvfrom(65536);s.sendto(d,a)
 threading.Thread(target=tcp,daemon=True).start();udp()

@@ -1,9 +1,9 @@
 # VM validation, 2026-10-28
 
 The `wine-process-attribution` implementation was tested without installing a
-service or changing the desktop. These are diagnostic results, not proof of
-end-to-end mihomo routing. Source and reproduction commands are in the
+service or changing the desktop. These are diagnostic results. Source and reproduction commands are in the
 [experiment README](../README.md).
+Later [routing validation](routing/README.md) covers mihomo and pasta.
 The [earlier research evidence](../research/README.md) records separate
 proof-of-concept runs; its observations are not results from this implementation.
 

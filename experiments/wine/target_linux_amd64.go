@@ -26,6 +26,7 @@ type targetConfig struct {
 	CurrentAddress uint64
 	ExeInode       uint64
 	KernelExe      uint64
+	NetNS          uint64
 	ThreadProcess  uint32
 	ProcessID      uint32
 	ProcessUnixPID uint32

@@ -65,8 +65,8 @@ See [development](docs/development.md) for source builds and tests.
 
 An optional [Wine observer experiment](experiments/wine/README.md) identifies
 Windows socket creators from an unchanged, verified wineserver build. It is a
-separate diagnostic command; it does not yet connect Wine identities to mihomo
-rules or pasta's host sockets.
+separate command, which can also publish them for mihomo through a sandbox's
+pasta. It is started by hand and has no service integration.
 
 ## License
 

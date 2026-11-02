@@ -32,7 +32,8 @@ type rawEvent struct {
 	Owner           rawOwner
 }
 
-// Event is diagnostic output, not a stable reader contract. The creator name is
+// Event is diagnostic output, not a stable reader contract; routing reads the
+// pinned wine_flows map instead. The creator name is
 // never reassigned to the latest sender. A send/connect event describes an
 // attempted operation, not its successful completion.
 type Event struct {
@@ -69,7 +70,7 @@ func decodeEvent(data []byte) (Event, error) {
 	if err := binary.Read(bytes.NewReader(data), binary.NativeEndian, &r); err != nil {
 		return e, err
 	}
-	name := map[uint32]string{1: "connect", 2: "send", 3: "create", 4: "first-egress"}[r.Kind]
+	name := map[uint32]string{1: "connect", 2: "send", 3: "create", 4: "first-egress", 5: "relay"}[r.Kind]
 	if name == "" || r.Owner.SocketID == 0 || r.Owner.ServerTGID == 0 || r.Owner.ServerStartNS == 0 {
 		return e, errors.New("invalid Wine diagnostic record")
 	}
@@ -84,7 +85,8 @@ func decodeEvent(data []byte) (Event, error) {
 	default:
 		return e, errors.New("invalid Wine socket protocol")
 	}
-	e.Status = map[uint32]string{1: "known", 2: "unreadable-request", 3: "invalid-image", 4: "changed-request", 5: "invalid-process"}[o.Status]
+	e.Status = map[uint32]string{1: "known", 2: "unreadable-request", 3: "invalid-image", 4: "changed-request", 5: "invalid-process",
+		6: "ambiguous-relay", 7: "no-inner-flow", 8: "not-wine"}[o.Status]
 	if e.Status == "" {
 		return e, errors.New("invalid Wine capture status")
 	}

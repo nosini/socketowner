@@ -2,10 +2,11 @@
 #include <windows.h>
 #include <mswsock.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static struct sockaddr_in addr(unsigned short port) {
-    struct sockaddr_in a={0}; a.sin_family=AF_INET;
-    a.sin_addr.s_addr=inet_addr("127.0.0.1"); a.sin_port=htons(port);return a;
+    struct sockaddr_in a={0}; const char *host=getenv("PROBE_HOST"); a.sin_family=AF_INET;
+    a.sin_addr.s_addr=inet_addr(host?host:"127.0.0.1"); a.sin_port=htons(port);return a;
 }
 int main(void) {
     WSADATA w; WSAStartup(MAKEWORD(2,2),&w);
@@ -24,7 +25,7 @@ int main(void) {
     if(r==SOCKET_ERROR && WSAGetLastError()==WSA_IO_PENDING) WSAGetOverlappedResult(s,&rv,&n,TRUE,&flags);
     printf("WSARecv bytes=%lu\n",n);closesocket(s);
     s=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
-    struct sockaddr_in local=addr(0);bind(s,(struct sockaddr*)&local,sizeof(local));
+    struct sockaddr_in local=addr(0);if(getenv("PROBE_HOST"))local.sin_addr.s_addr=INADDR_ANY;bind(s,(struct sockaddr*)&local,sizeof(local));
     GUID guid=WSAID_CONNECTEX;LPFN_CONNECTEX cx;DWORD size;
     WSAIoctl(s,SIO_GET_EXTENSION_FUNCTION_POINTER,&guid,sizeof(guid),&cx,sizeof(cx),&size,NULL,NULL);
     WSAOVERLAPPED cv={0};cv.hEvent=WSACreateEvent();
