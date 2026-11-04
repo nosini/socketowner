@@ -92,9 +92,9 @@ routing-mark: {MARK}
 find-process-mode: always
 find-process-bpf-map: {PIN}/conn_owners
 rules:
-  - PROCESS-NAME,beta.exe,REJECT
-  - PROCESS-NAME,alpha.exe,DIRECT
-  - PROCESS-NAME,wine-unknown,REJECT
+  - WINE-PROCESS-NAME,beta.exe,REJECT
+  - WINE-PROCESS-NAME,alpha.exe,DIRECT
+  - WINE-PROCESS-NAME,wine-unknown,REJECT
   - MATCH,DIRECT
 ''')
     mihomo = subprocess.Popen(['sudo', '-n', str(a.mihomo), '-d', str(a.work / 'mihomo')],
@@ -152,7 +152,7 @@ rules:
         exe = probe + '.exe'
         pid = re.search(r'Windows PID=(\d+)', output)
         assert pid, output[-800:]
-        matches = re.findall(rf'match ProcessName\({exe}\) using {rule}', log)
+        matches = re.findall(rf'match WineProcessName\({exe}\) using {rule}', log)
         relays = [r for r in records if r['type'] == 'relay' and r.get('windows_name') == exe]
         print(exe, 'mihomo matches', len(matches), 'relays', len(relays), flush=True)
         assert len(matches) == 2 and len(relays) == 3

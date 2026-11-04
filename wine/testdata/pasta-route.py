@@ -101,9 +101,9 @@ routing-mark: {MARK}
 find-process-mode: always
 find-process-bpf-map: {PIN}/conn_owners
 rules:
-  - PROCESS-NAME,beta.exe,REJECT
-  - PROCESS-NAME,alpha.exe,DIRECT
-  - PROCESS-NAME,wine-unknown,REJECT
+  - WINE-PROCESS-NAME,beta.exe,REJECT
+  - WINE-PROCESS-NAME,alpha.exe,DIRECT
+  - WINE-PROCESS-NAME,wine-unknown,REJECT
   - MATCH,DIRECT
 ''')
     mihomo = subprocess.Popen(['sudo', '-n', str(a.mihomo), '-d', str(a.work / 'mihomo')],
@@ -241,7 +241,7 @@ rules:
     host = [r for r in records if r['type'] == 'first-egress' and r['server_tgid'] and
             r['source'].startswith(HOST + ':')]
     for name, rule in (('alpha.exe', 'DIRECT'), ('beta.exe', 'REJECT')):
-        matches = re.findall(rf'match ProcessName\({re.escape(name)}\) using {rule}', log)
+        matches = re.findall(rf'match WineProcessName\({re.escape(name)}\) using {rule}', log)
         print(name, 'mihomo TCP matches using', rule + ':', len(matches), flush=True)
         assert len(matches) == 2, (name, matches)
     alpha_relays = [r for r in relays if r.get('windows_name') == 'alpha.exe']
@@ -251,7 +251,7 @@ rules:
     assert len(udp) == 2, udp
     print('UDP: first host packets attributed for', sorted(r['windows_name'] for r in udp), flush=True)
     assert any(r['status'] == 'not-wine' for r in relays), 'native flow was not distinguished'
-    assert 'ProcessName(wine-unknown) using REJECT' in log, 'native flow did not reach the unknown rule'
+    assert 'WineProcessName(wine-unknown) using REJECT' in log, 'native flow did not reach the unknown rule'
     print('native program in the sandbox: not-wine, refused by the wine-unknown rule', flush=True)
     ambiguous = [r for r in relays if r['status'] == 'ambiguous-relay']
     print('ambiguous relays while pasta was stopped:', len(ambiguous), flush=True)

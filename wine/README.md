@@ -2,8 +2,8 @@
 
 This optional command names the Windows program behind each outgoing TCP/UDP
 socket of every wineserver on the machine, for as long as it runs. It prints JSON
-diagnostics, and with `-pin` publishes the identities for mihomo's `PROCESS-NAME`
-and `PROCESS-PATH` rules, through each sandbox's pasta.
+diagnostics, and with `-pin` publishes the identities for mihomo's `WINE-PROCESS-NAME`
+and `WINE-PROCESS-PATH` rules, through each sandbox's pasta.
 
 It needs no Wine or pasta patch, injected DLL, uprobe, TLS adapter or sandbox
 capability, and no per-build profile. It is told nothing about Wine: wineservers
@@ -161,19 +161,22 @@ record. Active flows republish after LRU eviction. A reader must:
    image failing validation as **unknown**, not as absent. Falling through would
    name the relay, or whichever process now holds a reused port.
 
-mihomo reports unknown as the process `wine-unknown`, so that a deny can be
+mihomo keeps the socket's own process, the sandbox's pasta, and reports the
+Windows program separately, as `wine-unknown` when unknown, so that a deny can be
 written for it:
 
 ```yaml
 rules:
-  - PROCESS-NAME,tbs_browser.exe,REJECT
-  - PROCESS-NAME,wine-unknown,REJECT
+  - WINE-PROCESS-NAME,tbs_browser.exe,REJECT
+  - WINE-PROCESS-NAME,wine-unknown,REJECT
 ```
 
 A crash leaves the pins, which a new publisher replaces once the heartbeat has
-expired. While no observer runs, new flows have no record and show as pasta.
-A rule for the sandbox's pasta name can decide what those may do. `PROCESS-PATH`
-rules can't match a 32-bit client's full path, because it isn't known.
+expired. While no observer runs, new flows have no record and show only as pasta.
+A rule for the sandbox's pasta name can decide what those may do; it also matches
+the sandbox's identified flows, so place it after rules for its programs.
+`WINE-PROCESS-PATH` rules can't match a 32-bit client's full path, because it
+isn't known.
 
 ## How the relay works
 
