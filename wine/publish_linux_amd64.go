@@ -39,12 +39,9 @@ func bootTime() (uint64, error) {
 	return uint64(ts.Nano()), nil
 }
 
-// claim refuses a live publisher and clears what a crashed one left.
+// claim refuses a live publisher and clears what a crashed one left, which
+// may lack wine_flows if it died while publishing or closing.
 func claim(dir string) error {
-	flows := filepath.Join(dir, flowsPin)
-	if _, err := os.Stat(flows); errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
 	m, err := ebpf.LoadPinnedMap(filepath.Join(dir, heartbeatPin), &ebpf.LoadPinOptions{ReadOnly: true})
 	if err == nil {
 		defer m.Close()
@@ -128,7 +125,10 @@ func (p *publication) beat() error {
 	return p.heartbeat.Update(uint32(0), now, ebpf.UpdateAny)
 }
 
+// close first makes the heartbeat stale, so that a crash while removing pins
+// leaves nothing which claim takes for a live publisher.
 func (p *publication) close() {
+	p.heartbeat.Update(uint32(0), uint64(0), ebpf.UpdateAny)
 	for _, name := range []string{flowsPin, heartbeatPin, abiPin} {
 		os.Remove(filepath.Join(p.dir, name))
 	}

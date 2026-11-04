@@ -133,7 +133,7 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 	if err := consume(Event{Type: "ready"}); err != nil {
 		return err
 	}
-	pasta := &relays{targets: coll.Maps["pasta_targets"], waiting: map[int]uint64{}}
+	pasta := newRelays(coll.Maps["pasta_targets"])
 	var reportedLosses uint64
 	var scanned time.Time
 	for {
@@ -145,7 +145,7 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 		}
 		if len(pasta.waiting) != 0 && time.Since(scanned) >= scanInterval {
 			scanned = time.Now()
-			if err := pasta.scan(consume); err != nil {
+			if err := pasta.scan(scanned, consume); err != nil {
 				return err
 			}
 		}
@@ -175,9 +175,9 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 			return err
 		}
 		if e.Type == "server" && !options.NoRelay {
-			pasta.waiting[int(e.ServerTGID)] = e.NetNS
 			scanned = time.Now()
-			if err := pasta.scan(consume); err != nil {
+			pasta.add(int(e.ServerTGID), e.NetNS, scanned)
+			if err := pasta.scan(scanned, consume); err != nil {
 				return err
 			}
 		}

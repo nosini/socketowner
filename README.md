@@ -67,7 +67,7 @@ An optional [Wine observer](wine/README.md) identifies
 Windows socket creators in unchanged Wine, needing no per-build data. It is a
 separate command, which can also publish them for mihomo through a sandbox's
 pasta. Run it continuously using the optional Wine observer unit in
-[hardened-proxy-service](https://github.com/nosini/hardened-proxy-service/tree/ebpf-process-lookup),
+[hardened-proxy-service](https://github.com/nosini/hardened-proxy-service),
 or start it by hand before launching games.
 
 ## License
