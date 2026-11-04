@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 // Prototype: attribute wineserver's sockets through the request pipe, and name
 // the client from its PEB. No Wine-internal layout is read.
 #include <linux/bpf.h>

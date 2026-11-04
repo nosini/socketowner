@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 // Optional Wine adapter. No native socketowner map is replaced.
 //
 // wineserver creates and connects Windows programs' sockets, so the kernel sees

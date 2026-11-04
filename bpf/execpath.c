@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 // Records the executable of every process, so that mihomo can name the owner
 // of a connection (see sockowner.c) without reading other processes' /proc
 // entries.

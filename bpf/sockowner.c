@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 // Records which process owns each outgoing TCP/UDP flow, so that mihomo can
 // match PROCESS-NAME and PROCESS-PATH rules after the socket has gone away and
 // without scanning /proc.

@@ -72,5 +72,11 @@ or start it by hand before launching games.
 
 ## License
 
-[GNU GPL v3](LICENSE). The BPF object files retain the same license as their
-sources.
+The userspace code is licensed under [GNU GPL v3](LICENSE).
+
+The BPF sources in `bpf/` and `wine/bpf/`, and the research BPF programs
+`wine/research/generic-capture/g.c`,
+`wine/research/attribution-research-evidence/custom-sockopt.bpf.c` and
+`wine/research/attribution-research-evidence/host-ebpf/observe.bpf.c`, are
+licensed under [GNU GPL v2 only](LICENSE.bpf), as marked by their SPDX headers.
+BPF object files retain the license of their sources.

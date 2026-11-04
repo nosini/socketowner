@@ -103,8 +103,8 @@ and process matching, including missing/unsupported version markers.
 
 ## Independent distribution
 
-Build and distribute the loader from this repository, including its license and
-the corresponding BPF sources. Do not add it to mihomo's build or release scripts.
+Build and distribute the loader from this repository, including both license files (`LICENSE` and
+`LICENSE.bpf`) and the corresponding BPF sources. Do not add it to mihomo's build or release scripts.
 Deployments install or update this binary explicitly, then restart its service.
 Service units, SELinux policy and reader-group setup belong to
 [hardened-proxy-service](https://github.com/nosini/hardened-proxy-service).

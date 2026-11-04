@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 // Socket-local owner records, shared by the cgroup programs in sockowner.c and
 // the LSM programs in execpath.c. The loader gives both objects the same
 // sock_owners map.
