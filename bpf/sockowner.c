@@ -27,6 +27,9 @@
 
 #include "sockowner.h"
 
+#define SOCK_STREAM 1
+#define SOCK_DGRAM 2
+
 struct conn_key {
 	__u64 netns;
 	__u8 addr[16]; // IPv4 is stored IPv4-mapped (::ffff:a.b.c.d)
@@ -166,6 +169,14 @@ static __always_inline int packet_source_port(struct __sk_buff *skb,
 	return 0;
 }
 
+// Kernel-generated replies (RST for a closed port, ACK for a time-wait flow)
+// leave from a per-CPU SOCK_RAW TCP control socket. It has no owning user
+// process, so its packets must not replace an existing flow's owner.
+static __always_inline int tracked_socket_type(__u32 type)
+{
+	return type == SOCK_STREAM || type == SOCK_DGRAM;
+}
+
 SEC("cgroup_skb/egress")
 int egress(struct __sk_buff *skb)
 {
@@ -177,11 +188,15 @@ int egress(struct __sk_buff *skb)
 	if (!sk)
 		return 1;
 	sk = bpf_sk_fullsock(sk);
-	if (!sk || !tracked_protocol(sk->protocol))
+	if (!sk || !tracked_socket_type(sk->type) ||
+	    !tracked_protocol(sk->protocol))
 		return 1;
 	// Sockets that existed before the programs were attached and accepted
 	// sockets have no owner. They still publish an empty owner, so that a
 	// stale entry for the same address and port is not mistaken for theirs.
+	// MPTCP's TCP subflows are kernel sockets that also have no owner; as we
+	// can't reach the MPTCP socket's owner from here without CAP_PERFMON,
+	// they publish unknown (TGID 0) too, rather than a stale owner.
 	so = bpf_sk_storage_get(&sock_owners, sk, 0,
 				BPF_SK_STORAGE_GET_F_CREATE);
 	if (!so)

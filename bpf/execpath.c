@@ -71,13 +71,24 @@ struct mm_struct {
 	struct file *exe_file;
 } __attribute__((preserve_access_index));
 
+struct vm_area_struct {
+	struct mm_struct *vm_mm;
+} __attribute__((preserve_access_index));
+
 struct task_struct {
 	int pid;
 	int tgid;
 	__u64 start_boottime;
-	struct mm_struct *mm;
 	struct task_struct *group_leader;
 } __attribute__((preserve_access_index));
+
+// Iterating a task's VMAs holds a reference to its mm, which also keeps the
+// mm's exe_file alive while bpf_d_path reads it.
+struct bpf_iter_task_vma { __u64 __opaque[1]; };
+extern int bpf_iter_task_vma_new(struct bpf_iter_task_vma *it,
+				 struct task_struct *task, __u64 addr) __ksym;
+extern struct vm_area_struct *bpf_iter_task_vma_next(struct bpf_iter_task_vma *it) __ksym;
+extern void bpf_iter_task_vma_destroy(struct bpf_iter_task_vma *it) __ksym;
 
 struct sock_common {
 	unsigned short skc_family;
@@ -142,6 +153,46 @@ struct {
 	__type(value, struct exec_path);
 } seed_scratch SEC(".maps");
 
+// The update helper copies a whole record, so this also tells whether the
+// storage now holds what the caller wrote or something another program wrote.
+static __always_inline int same_record(const struct exec_path *a,
+				       const struct exec_path *b)
+{
+	const __u8 *pa = (const __u8 *)a, *pb = (const __u8 *)b;
+
+	for (int i = 0; i < sizeof(*a); i++)
+		if (pa[i] != pb[i])
+			return 0;
+	return 1;
+}
+
+// Fills in the path of a task's current executable. The VMA iterator pins the
+// task's mm for as long as the iterator lives, so its exe_file can't be freed
+// by a concurrent exit or exec while bpf_d_path reads it. The caller sets
+// start_ns. A task without an mm (kernel thread or exited) has no record.
+static __always_inline int record_exe_path(struct task_struct *task,
+					   struct exec_path *e)
+{
+	struct bpf_iter_task_vma it;
+	struct vm_area_struct *v;
+	struct mm_struct *mm;
+	struct file *exe;
+	int found = 0;
+
+	if (bpf_iter_task_vma_new(&it, task, 0)) {
+		bpf_iter_task_vma_destroy(&it);
+		return 0;
+	}
+	v = bpf_iter_task_vma_next(&it);
+	if (v && (mm = v->vm_mm) && (exe = mm->exe_file)) {
+		e->exit_ns = 0;
+		e->len = bpf_d_path(&exe->f_path, e->path, sizeof(e->path));
+		found = 1;
+	}
+	bpf_iter_task_vma_destroy(&it);
+	return found;
+}
+
 // Called once a new program has replaced the process image; bprm->file is the
 // program that runs, which for a script is its interpreter, as in
 // /proc/<pid>/exe. A thread that executes has become the thread group leader
@@ -151,7 +202,7 @@ int BPF_PROG(record_exec, struct linux_binprm *bprm)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
 	__u32 tgid = task->tgid;
-	struct exec_path *e;
+	struct exec_path *e, *stored;
 
 	e = bpf_task_storage_get(&exec_scratch, task, 0,
 				 BPF_LOCAL_STORAGE_GET_F_CREATE);
@@ -165,8 +216,17 @@ int BPF_PROG(record_exec, struct linux_binprm *bprm)
 	// than writing into it, which a reader could see half done. Until the
 	// new record is in place, readers find it in exec_recent.
 	bpf_task_storage_delete(&exec_tasks, task);
-	bpf_task_storage_get(&exec_tasks, task, e,
-			     BPF_LOCAL_STORAGE_GET_F_CREATE);
+	// The seeding iterator can create the storage between the delete and
+	// the create, using an exe_file it read before the exec. Its record
+	// would then survive because create doesn't replace an existing one.
+	// Detect that and replace it once more.
+	stored = bpf_task_storage_get(&exec_tasks, task, e,
+				      BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!stored || !same_record(stored, e)) {
+		bpf_task_storage_delete(&exec_tasks, task);
+		bpf_task_storage_get(&exec_tasks, task, e,
+				     BPF_LOCAL_STORAGE_GET_F_CREATE);
+	}
 	bpf_task_storage_delete(&exec_scratch, task);
 	return 0;
 }
@@ -186,14 +246,28 @@ int BPF_PROG(record_fork, struct task_struct *task, unsigned long clone_flags,
 	if (clone_flags & CLONE_THREAD)
 		return 0;
 	e = bpf_task_storage_get(&exec_tasks, parent, 0, 0);
+	if (e) {
+		e = bpf_task_storage_get(&exec_tasks, task, e,
+					 BPF_LOCAL_STORAGE_GET_F_CREATE);
+		// The task's own start time isn't set yet. Nothing can look
+		// the record up before the task has an ID.
+		if (e)
+			e->start_ns = bpf_ktime_get_boot_ns();
+		return 0;
+	}
+	// The parent hasn't been seeded yet. Build the child's record from the
+	// parent's executable so a child the iterator has already passed still
+	// gets one, and its descendants inherit it.
+	e = bpf_task_storage_get(&exec_scratch, task, 0,
+				 BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!e)
 		return 0;
-	e = bpf_task_storage_get(&exec_tasks, task, e,
-				 BPF_LOCAL_STORAGE_GET_F_CREATE);
-	// The task's own start time isn't set yet. Nothing can look the
-	// record up before the task has an ID.
-	if (e)
+	if (record_exe_path(parent, e)) {
 		e->start_ns = bpf_ktime_get_boot_ns();
+		bpf_task_storage_get(&exec_tasks, task, e,
+				     BPF_LOCAL_STORAGE_GET_F_CREATE);
+	}
+	bpf_task_storage_delete(&exec_scratch, task);
 	return 0;
 }
 
@@ -273,28 +347,28 @@ SEC("iter/task")
 int seed_tasks(struct bpf_iter__task *ctx)
 {
 	struct task_struct *task = ctx->task;
-	struct mm_struct *mm;
-	struct file *exe;
 	struct exec_path *e;
 	__u32 zero = 0;
 
 	if (!task || task->group_leader != task)
 		return 0;
-	mm = task->mm;
-	if (!mm) // kernel thread or exited
-		return 0;
-	exe = mm->exe_file;
-	if (!exe)
-		return 0;
 	// The hooks are already attached; what they recorded is newer.
 	if (bpf_task_storage_get(&exec_tasks, task, 0, 0))
+		return 0;
+	// A task executing right now may not have its new record yet. Leave it
+	// to record_exec, whose scratch also marks that window.
+	if (bpf_task_storage_get(&exec_scratch, task, 0, 0))
 		return 0;
 	e = bpf_map_lookup_elem(&seed_scratch, &zero);
 	if (!e)
 		return 0;
+	if (!record_exe_path(task, e)) // kernel thread, exited, or no executable
+		return 0;
 	e->start_ns = task->start_boottime;
-	e->exit_ns = 0;
-	e->len = bpf_d_path(&exe->f_path, e->path, sizeof(e->path));
+	// record_exec may have started while the path was read; it updates the
+	// storage once it completes, and its own retry covers the other order.
+	if (bpf_task_storage_get(&exec_scratch, task, 0, 0))
+		return 0;
 	bpf_task_storage_get(&exec_tasks, task, e,
 			     BPF_LOCAL_STORAGE_GET_F_CREATE);
 	return 0;

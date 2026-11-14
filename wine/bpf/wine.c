@@ -29,8 +29,12 @@
 #define NOT_WINE 8
 #define S_IFMT 0170000
 #define S_IFIFO 0010000
+#define SOCK_STREAM 1
+#define SOCK_DGRAM 2
 #define MAY_WRITE 2
 #define MAY_READ 4
+// thread_info.status: a 32-bit syscall is active, so the task is compat.
+#define TS_COMPAT 0x0002
 // pasta handles a SYN as soon as it reads the TAP; older records are leftovers.
 #define RELAY_TTL_NS 2000000000ULL
 
@@ -43,7 +47,9 @@ struct vm_area_struct { struct file *vm_file; } __attribute__((preserve_access_i
 struct net { __u64 net_cookie; } __attribute__((preserve_access_index));
 struct nsproxy { struct net *net_ns; } __attribute__((preserve_access_index));
 struct thread_struct { unsigned long gsbase; } __attribute__((preserve_access_index));
+struct thread_info { __u32 status; } __attribute__((preserve_access_index));
 struct task_struct {
+	struct thread_info thread_info;
 	struct task_struct *group_leader;
 	struct nsproxy *nsproxy;
 	struct thread_struct thread;
@@ -273,9 +279,10 @@ static __always_inline void note_server(struct task_struct *task, __u32 tgid)
 	config = bpf_map_lookup_elem(&wine_config, &zero);
 	if (!config)
 		return;
-	bpf_map_update_elem(&servers, &tgid, &record, BPF_ANY);
-	if (netns == config->host_netns)
+	if (netns == config->host_netns) {
+		bpf_map_update_elem(&servers, &tgid, &record, BPF_ANY);
 		return;
+	}
 	bpf_map_update_elem(&relay_netns, &netns, &present, BPF_ANY);
 	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e) {
@@ -287,6 +294,9 @@ static __always_inline void note_server(struct task_struct *task, __u32 tgid)
 	e->actor_tgid = tgid;
 	e->flow.netns = netns;
 	bpf_ringbuf_submit(e, 0);
+	// Mark the server known only once its event is queued, so a lost event
+	// is retried on the server's next request.
+	bpf_map_update_elem(&servers, &tgid, &record, BPF_ANY);
 }
 
 // The first mapped file named *.exe, for 32-bit Linux clients, which have no
@@ -323,20 +333,24 @@ static __always_inline int mapped_image(struct task_struct *task, struct client 
 }
 
 // These offsets are the Windows x86-64 TEB, PEB and process parameters: public
-// layouts, not Wine's. TEB.Self confirms GS holds a TEB. A failure is retried on
-// the client's next request, and leaves its sockets unknown until then.
+// layouts, not Wine's. TEB.Self confirms GS holds a TEB. A 64-bit client can
+// fail that check before its GS is set, so such a failure is retried on its
+// next request, and leaves its sockets unknown until then. Only compat (32-bit)
+// tasks use the mapped-image fallback, which can name but not path them.
 static __always_inline void read_client(struct task_struct *task, struct client *c)
 {
 	__u64 teb = task->thread.gsbase, self = 0, peb = 0, parameters = 0, buffer = 0, id = 0;
 	__u32 flags = 0;
 	__u16 length = 0;
 	if (!c->peb) {
-		if (!teb || bpf_probe_read_user(&self, 8, (void *)(teb + 0x30)) || self != teb ||
-		    bpf_probe_read_user(&peb, 8, (void *)(teb + 0x60)) || !peb) {
+		if (task->thread_info.status & TS_COMPAT) {
 			if (mapped_image(task, c))
 				c->status = KNOWN;
 			return;
 		}
+		if (!teb || bpf_probe_read_user(&self, 8, (void *)(teb + 0x30)) || self != teb ||
+		    bpf_probe_read_user(&peb, 8, (void *)(teb + 0x60)) || !peb)
+			return;
 		if (!bpf_probe_read_user(&id, 8, (void *)(teb + 0x40)) && id && id <= 0xffffffff)
 			c->windows_pid = id;
 		c->peb = peb;
@@ -377,10 +391,16 @@ int BPF_PROG(wine_file, struct file *file, int mask, int ret)
 			return 0;
 		note_server(task, tgid);
 		pipe = bpf_map_lookup_elem(&request_pipes, &key);
-		if (pipe)
+		if (pipe) {
 			bpf_map_update_elem(&serving, &tgid, pipe, BPF_ANY);
-		else
+		} else {
+			// This pipe's client hasn't written since the observer
+			// started, or its request_pipes entry was evicted. Don't
+			// attribute a socket in this request to the previous
+			// client: blank serving means no client.
 			bpf_map_update_elem(&request_pipes, &key, &id, BPF_NOEXIST);
+			bpf_map_update_elem(&serving, &tgid, &id, BPF_ANY);
+		}
 		return 0;
 	}
 	if (!(mask & MAY_WRITE) || !(pipe = bpf_map_lookup_elem(&request_pipes, &key)))
@@ -717,6 +737,12 @@ int wine_egress(struct __sk_buff *skb)
 	struct flow f = {};
 	struct bpf_sock *sk = skb->sk;
 	if (!sk)
+		return 1;
+	// Kernel-generated RST/ACK replies leave from a per-CPU SOCK_RAW TCP
+	// control socket. It has no user owner or Wine identity, so ignore it
+	// rather than removing the record of the flow it answers for.
+	sk = bpf_sk_fullsock(sk);
+	if (!sk || (sk->type != SOCK_STREAM && sk->type != SOCK_DGRAM))
 		return 1;
 	s = bpf_sk_storage_get(&wine_sockets, sk, 0, 0);
 	if (s && !s->ready)
