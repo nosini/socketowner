@@ -29,9 +29,10 @@ sudo ./socketowner-wine-observer -pin /sys/fs/bpf/mihomo/maps -reader-group miho
 Without `-pin` it only prints diagnostics. `-sends` also reports send attempts,
 including the Linux process performing each send. `-cgroup` selects the cgroup v2
 ancestor used for egress observation; its default is `/sys/fs/cgroup`. Select an
-ancestor covering Wine and pasta. Stop it with Ctrl-C. Nothing stays attached
-after it exits or crashes. Pins are removed on exit; a crash leaves them until the
-next publisher.
+ancestor covering Wine and pasta. `-reader-group` takes a group name or a numeric
+GID; a GID needs no group entry. SIGINT (Ctrl-C), SIGTERM, SIGHUP and SIGPIPE
+stop it and remove its pins. Nothing stays attached after it exits or crashes.
+Pins are removed on exit; a crash leaves them until the next publisher.
 
 The observer needs host BPF/LSM and cgroup attachment privileges, and permission
 to inspect other processes' file descriptors to find pasta, so `CAP_SYS_PTRACE`
@@ -39,7 +40,9 @@ in addition to `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`. Root in the test VM
 supplies these rights. The optional service and SELinux policy live in
 [hardened-proxy-service](https://github.com/nosini/hardened-proxy-service), not in
 this repository. The command sends systemd readiness after publishing its maps
-when `NOTIFY_SOCKET` is set. Wine and games remain unprivileged.
+when `NOTIFY_SOCKET` is set. It refuses to start unless `bpf` appears in
+`/sys/kernel/security/lsm`, because its LSM hooks would otherwise attach without
+recording anything. Wine and games remain unprivileged.
 
 A wineserver which predates the observer is picked up at its next request, but
 sockets it already created stay unlabelled.
@@ -72,12 +75,12 @@ native socketowner's latest-Linux-user semantics. Connect/send diagnostics descr
 attempted operations, not successful completion.
 
 A client whose name could not be read has status `no-image`, and a socket with no
-known client `no-client`. Neither carries a partial name. Paths are limited to 1024
-UTF-16 bytes; no truncated path becomes a matchable name.
+known client `no-client`. Neither carries a partial name. Images are limited to
+1024 bytes; no truncated image becomes a matchable name.
 
 The event buffer is bounded. Buffer exhaustion increments a reported `loss`
-count, and a lost `server` event leaves that sandbox's pasta unregistered. Routing
-records do not pass through this buffer.
+count, and a lost `server` event is retried rather than leaving that sandbox's
+pasta unregistered. Routing records do not pass through this buffer.
 
 ## How capture works
 
@@ -86,17 +89,23 @@ only wineserver. Which program asked is recoverable from Wine's request protocol
 
 1. Each client thread has a request pipe. wineserver's read from a FIFO marks it,
    and the next write by another process names that pipe's client
-   (`lsm/file_permission`).
+   (`lsm/file_permission`). A pipe read for the first time names nobody until
+   its client writes, so a socket created before then is `no-client`, not the
+   client of an earlier request.
 2. Each later read records the client being served. wineserver is single-threaded
    and handles a request within the read which fetched it, so the sockets which
    follow are that client's (`lsm/socket_post_create`).
 3. The client names itself, read during its own write, while its memory is
    current. For 64-bit clients, GS holds the TEB, confirmed by `TEB.Self`, and
    `Peb`, `ProcessParameters` and `ImagePathName` lead to the full path. These are
-   public Windows x86-64 layouts, not Wine's.
+   public Windows x86-64 layouts, not Wine's. If the path can't be read yet, the
+   client stays `no-image` and is retried on its next request; it does not fall
+   back to a mapped name.
 4. 32-bit programs run as true 32-bit Linux processes on the tested runners, so
-   GS is glibc's TLS and that check fails. They fall back to the first mapped file
-   named `*.exe`, which gives the name but not the path, and no Windows PID.
+   GS is glibc's TLS and that check fails. Encoding 1 is used only for such a
+   client: the first mapping by address whose Linux file name ends in `.exe`.
+   That gives a file name but not the path, and no Windows PID. The first such
+   mapping need not be the program's image, so the name can be wrong.
 
 Client records carry the process's start time and are dropped on exec, so a reused
 PID can't inherit a name. A failed read is retried on the client's next request.
@@ -116,7 +125,11 @@ was 37% in a benchmark doing nothing else.
 `-pin DIR`, normally socketowner's `maps` directory, adds three optional pins
 beside its ABI v1 maps. V1 records are unchanged, so no v1 version change applies.
 These have their own version, currently 2, and their pins come and go with the
-observer:
+observer. Each pin appears under its final name with its final owner and mode.
+The heartbeat runs independently of the diagnostic output, so a blocked or closed
+stdout does not make live records stale. If its pins disappear, for example after
+a `socketowner detach` from a loader that removed them, the observer publishes
+them again. On exit it removes only pins that are still its own.
 
 | Pin | Linux map type | Key bytes | Value bytes | Meaning |
 | --- | --- | ---: | ---: | --- |
@@ -143,23 +156,38 @@ connection key. All integers are native endian. The value is:
 | 60 | uint32 | Image encoding |
 | 64 | uint16[512] | Image, not NUL terminated |
 
-Encoding 0 is a full Windows path in UTF-16. Encoding 1 is a filename in bytes,
-with no directory. Readers must reject other values.
+Encoding 0 is an absolute Windows path in UTF-16. Encoding 1 is one file name in
+bytes, with no directory. Readers must reject other values.
+
+An image is valid only under these rules. For encoding 0, `ImageBytes` is even
+and 2 to 1024; the UTF-16 text has no U+0000 and no unpaired surrogate; after `/`
+becomes `\` and a `\??\` or `\\?\` prefix is removed (with a following `UNC\`
+becoming `\\`), it begins with a drive letter and `:\`, or with
+`\\server\share\`; and its last component is neither empty nor `.` or `..`. For
+encoding 1, `ImageBytes` is 1 to 1024, the bytes are valid UTF-8 with no NUL, `/`
+or `\`, and the name is a single component, not `.` or `..`. A name from
+encoding 1 is reported with no path, because no directory is known. `wine_flows`
+is written by BPF from the client's raw memory and checks only the length it
+copies, so every reader must apply these rules; an image that fails them is
+unknown.
 
 Status 1 is known. 2 means no client was known, 3 that its name could not be read,
 6 that owners differed while waiting for pasta, 7 that pasta's socket matched no
 inner flow, and 8 that the inner flow came from a socket with no Windows identity.
+Any other status is invalid.
 
 The kernel writes a record before the packet it describes leaves `wine_egress`,
 so it precedes mihomo's first lookup; it does not depend on the event buffer.
-An unlabelled socket which sends from a recorded address and port removes the
-record. Active flows republish after LRU eviction. A reader must:
+An unlabelled userspace socket which sends from a recorded address and port
+removes the record; a packet from the kernel's TCP control socket, such as a
+generated reset or acknowledgement, changes nothing. Active flows republish
+after LRU eviction. A reader must:
 
 1. Check the version, map types and sizes before any lookup, as for v1.
 2. Consult `wine_flows` first. No record means ordinary lookup proceeds.
 3. Treat a record with another status, a heartbeat older than five seconds, or an
-   image failing validation as **unknown**, not as absent. Falling through would
-   name the relay, or whichever process now holds a reused port.
+   image failing the validation above as **unknown**, not as absent. Falling
+   through would name the relay, or whichever process now holds a reused port.
 
 mihomo keeps the socket's own process, the sandbox's pasta, and reports the
 Windows program separately, as `wine-unknown` when unknown, so that a deny can be
@@ -177,6 +205,17 @@ A rule for the sandbox's pasta name can decide what those may do; it also matche
 the sandbox's identified flows, so place it after rules for its programs.
 `WINE-PROCESS-PATH` rules can't match a 32-bit client's full path, because it
 isn't known.
+
+### Evolution
+
+Any change to the key or value layout, or to the meaning of a field, status value
+or image encoding, requires a new `wine_abi` version; a reader must reject a
+version it does not know before interpreting `wine_flows`. Version 1 had the same
+sizes and offsets, but field 16 held the Windows process start time that
+wineserver recorded, field 44 the client's Unix PID in wineserver's namespace,
+field 60 was padding, and the image was always a UTF-16 Windows path. Its statuses
+2 to 5 were capture failures. Version 2 replaced it before the mihomo reader was
+released, and that reader has required 2 since it appeared.
 
 ## How the relay works
 
@@ -201,10 +240,13 @@ order. Records older than two seconds are ignored.
 A wineserver's first request tells BPF its network namespace, and from then on
 flows there are recorded, before any of its programs can have sent one. The
 observer then looks for the sandbox's pasta: a process outside that namespace,
-holding a descriptor for it, whose executable name contains `pasta`. Registration
-is keyed by pidfd and revoked on exec. No pasta memory is read, so its updates
-don't matter. A flow pasta connects before that registration has no record, and
-shows as pasta; this did not occur in testing, but nothing prevents it.
+holding a descriptor for it, whose executable name contains `pasta`. A failed
+lookup is logged and retried; it does not stop the observer. Registration is
+keyed by pidfd and revoked on exec. A registered sandbox is checked again, so a
+pasta that replaces the previous one is registered too. No pasta memory is read,
+so its updates don't matter. A flow pasta connects before that registration has
+no record, and shows as pasta; this did not occur in testing, but nothing
+prevents it.
 
 The relay inherits the capture's trust limit, and a sandboxed program can provoke
 unknown results by racing another program to one destination.
@@ -251,8 +293,20 @@ including its SELinux domain and shared routing maps. Probes need Wine's
   [service validation](validation/service/README.md); Wine relay load remains untested.
 - **A multi-threaded wineserver** would break step 2 of capture. None exists among
   the tested runners; the design has no detection for one yet.
-- **DNS.** Flows sent to pasta's `--dns-forward` address are translated, so they
-  find no inner record and are unknown, [as seen in NIKKE](validation/nikke/README.md).
-  A rule refusing `wine-unknown` must exempt any it reaches.
+- **Sockets the client opens itself.** Only sockets created by wineserver are
+  labelled. A Windows program can also open sockets in its own Linux process,
+  including the glibc resolver behind `getaddrinfo`, GStreamer and libldap. In the
+  host namespace they keep the native process name, so a `WINE-PROCESS-NAME` deny
+  does not cover them. In a sandbox they are recorded as `not-wine` and reported
+  as `wine-unknown`.
+- **DNS.** Name resolution runs in the client's Linux process, not wineserver, so
+  its socket is not labelled. A query to pasta's `--dns-forward` address is also
+  translated, so it matches no inner record; it is reported as `wine-unknown`
+  rather than `not-wine`, [as seen in NIKKE](validation/nikke/README.md). A rule
+  refusing `wine-unknown` must exempt any it reaches.
+- **32-bit names.** A 32-bit client is named after the first mapped file whose
+  Linux name ends in `.exe`, in address order. That need not be the program's
+  image, and a Linux file name is not a Windows image name, so the name can be
+  wrong. No path is available.
 - **UDP reuse.** A new inner socket reusing a live UDP 4-tuple inherits pasta's
   existing flow, and with it the previous owner until that flow expires.

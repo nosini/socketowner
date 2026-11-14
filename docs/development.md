@@ -18,18 +18,23 @@ On Linux, mihomo can look up the process behind a connection in BPF maps instead
   records by process ID, including those of processes that have exited. A process's record goes
   there at exec and when it's freed, which can be well after it was reaped and can no longer be
   found by process ID, so LSM hooks on `socket_connect` and `socket_sendmsg` also save it the
-  first time the process uses a socket. Each record has the process's start time, so a reused
-  process ID isn't mistaken for the owner. An iterator adds the processes that were already
+  first time the process uses a socket. Each record has the process's start and task-free times,
+  so most reused process IDs are rejected; the exact limits are in
+  [map interface v1](map-interface.md). An iterator adds the processes that were already
   running. Only LSM hooks record, because the kernel skips a tracing program on a CPU where the
   same program was preempted, which would leave a forked process without a record.
 - The repository root builds `socketowner` as an independent Go module using
   cilium/ebpf. `socketowner attach` loads the programs, attaches them to the root cgroup
   and pins the links in `/sys/fs/bpf/mihomo/links` and the map in
   `/sys/fs/bpf/mihomo/maps/conn_owners`, then exits. `socketowner detach` removes the
-  pins. It needs `CAP_BPF` and `CAP_NET_ADMIN`, plus `CAP_CHOWN` for `-reader-group`. With
+  loader's pins and leaves any Wine observer pins in the same directory. If attaching fails
+  after any program is attached, the loader removes its pins, so no partial attachment
+  remains. It needs `CAP_BPF` and `CAP_NET_ADMIN`, plus `CAP_CHOWN` for `-reader-group`.
+  `-reader-group` takes a group name or a numeric GID; a GID needs no group entry. With
   `-exec-paths` it also attaches the programs of `execpath.c` and pins their maps next to
   `conn_owners`. Those read kernel structures, relocated with the kernel's BTF, so they need
-  `CAP_PERFMON` and a kernel with the BPF LSM active (`bpf` in `/sys/kernel/security/lsm`).
+  `CAP_PERFMON` and a kernel with the BPF LSM active; the loader checks that `bpf` is listed
+  in `/sys/kernel/security/lsm` before loading them, and refuses `-exec-paths` otherwise.
   `-reader-group` gets read access to the `maps` directory and the maps, which stay root's:
   their owner could make them writable and forge entries. Anyone may pass through the pin
   directory to `maps`. `/sys/fs/bpf` itself is usually root's alone, though, so a reader that

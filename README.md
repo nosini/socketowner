@@ -32,13 +32,16 @@ sudo /usr/local/bin/socketowner -reader-group mihomo -exec-paths attach
 
 The default pin directory is `/sys/fs/bpf/mihomo`. `-pin` changes it; `-cgroup`
 selects a cgroup v2 directory instead of `/sys/fs/cgroup`. Flags precede `attach`
-or `detach`. bpffs must already be mounted at `/sys/fs/bpf`.
+or `detach`. bpffs must already be mounted at `/sys/fs/bpf`. `-reader-group` takes
+a group name or a numeric GID; a GID needs no group entry.
 
-`-exec-paths` requires kernel BTF and an active BPF LSM. Without it, the loader
-records socket owners only, and mihomo needs `/proc` access to resolve their
-executables. Attaching needs `CAP_BPF` and `CAP_NET_ADMIN`, plus `CAP_CHOWN` for
-`-reader-group` and `CAP_PERFMON` for `-exec-paths`. The loader exits after attach;
-pinned links keep the programs running.
+`-exec-paths` requires kernel BTF and an active BPF LSM; the loader checks that
+`bpf` appears in `/sys/kernel/security/lsm` and refuses the flag otherwise.
+Without it, the loader records socket owners only, and mihomo needs `/proc`
+access to resolve their executables. Attaching needs `CAP_BPF` and `CAP_NET_ADMIN`,
+plus `CAP_CHOWN` for `-reader-group` and `CAP_PERFMON` for `-exec-paths`. The
+loader exits after attach; pinned links keep the programs running. If attaching
+fails after any program is attached, it removes its pins.
 
 Point mihomo's `find-process-bpf-map` at `maps/conn_owners` inside the pin directory
 (or its read-only bind mount). Set `find-process-bpf-only: true` with `-exec-paths`
@@ -52,7 +55,8 @@ sudo /usr/local/bin/socketowner detach
 ```
 
 Use the same `-pin` for attach and detach if you changed it. Both commands preserve
-the map directory so existing directory bind mounts keep working.
+the map directory so existing directory bind mounts keep working. Detach removes
+the loader's pins and leaves Wine observer pins in place.
 
 ## Compatibility and updates
 
