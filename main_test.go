@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 
@@ -233,5 +234,72 @@ func TestMakePinDirs(t *testing.T) {
 	}
 	if st := fi.Sys().(*syscall.Stat_t); int(st.Uid) != os.Getuid() || int(st.Gid) != gid {
 		t.Errorf("%s: owner %d:%d, want %d:%d", maps, st.Uid, st.Gid, os.Getuid(), gid)
+	}
+}
+
+// The flag accepts a GID with no group entry, which is how a service can name
+// a group it doesn't need to look up.
+func TestLookupGroupNumeric(t *testing.T) {
+	if gid, err := lookupGroup(""); err != nil || gid != -1 {
+		t.Fatalf("empty group: %d, %v", gid, err)
+	}
+	const want = 424242
+	if gid, err := lookupGroup(strconv.Itoa(want)); err != nil || gid != want {
+		t.Fatalf("numeric group: %d, %v", gid, err)
+	}
+	if _, err := lookupGroup("socketowner-no-such-group"); err == nil {
+		t.Fatal("accepted a missing group name")
+	}
+}
+
+func TestCheckBPFLSM(t *testing.T) {
+	dir := t.TempDir()
+	active := filepath.Join(dir, "active")
+	if err := os.WriteFile(active, []byte("lockdown,yama,integrity,bpf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBPFLSMAt(active); err != nil {
+		t.Fatal(err)
+	}
+	inactive := filepath.Join(dir, "inactive")
+	if err := os.WriteFile(inactive, []byte("lockdown,yama,integrity\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBPFLSMAt(inactive); err == nil {
+		t.Fatal("accepted a host without the BPF LSM")
+	}
+	if err := checkBPFLSMAt(filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("accepted a missing LSM list")
+	}
+}
+
+// Attach and detach share the maps directory with the Wine observer. Only the
+// loader's own maps, including a temporary pin, may be removed.
+func TestDetachKeepsWinePins(t *testing.T) {
+	pin := t.TempDir()
+	for _, dir := range []string{"links", "maps"} {
+		if err := os.Mkdir(filepath.Join(pin, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loader := []string{"links/sock_create", "maps/conn_owners", "maps/abi_version", "maps/exec_tasks", "maps/conn_owners-pin-12-1"}
+	wine := []string{"maps/wine_flows", "maps/wine_heartbeat", "maps/wine_abi"}
+	for _, path := range append(loader, wine...) {
+		if err := os.WriteFile(filepath.Join(pin, path), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := detach(pin); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range loader {
+		if _, err := os.Stat(filepath.Join(pin, path)); !os.IsNotExist(err) {
+			t.Errorf("%s left behind: %v", path, err)
+		}
+	}
+	for _, path := range wine {
+		if _, err := os.Stat(filepath.Join(pin, path)); err != nil {
+			t.Errorf("removed another publisher's %s: %v", path, err)
+		}
 	}
 }

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"os/user"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/nosini/socketowner/wine"
@@ -30,28 +32,66 @@ func run() error {
 	}
 	options := wine.Options{Cgroup: *cgroup, Sends: *sends, NoRelay: *noRelay, Pin: *pin, Group: -1}
 	if *readerGroup != "" {
-		g, err := user.LookupGroup(*readerGroup)
+		gid, err := groupID(*readerGroup)
 		if err != nil {
-			if g, err = user.LookupGroupId(*readerGroup); err != nil {
-				return err
-			}
-		}
-		if options.Group, err = strconv.Atoi(g.Gid); err != nil {
 			return err
 		}
+		options.Group = gid
 	}
 	encoder := json.NewEncoder(os.Stdout)
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	return wine.Observe(ctx, options, func(e wine.Event) error {
+	// SIGHUP, SIGINT and SIGTERM stop cleanly. SIGPIPE is caught so a broken
+	// stdout cannot kill the process before it unpins; event output then ends
+	// and the process exits non-zero, which systemd's Restart=on-failure sees.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	signals := make(chan os.Signal, 4)
+	signal.Notify(signals, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGPIPE)
+	defer signal.Stop(signals)
+	var brokenPipe atomic.Bool
+	go func() {
+		select {
+		case <-ctx.Done():
+		case sig := <-signals:
+			if sig == syscall.SIGPIPE {
+				brokenPipe.Store(true)
+			}
+			cancel()
+		}
+	}()
+	err := wine.Observe(ctx, options, func(e wine.Event) error {
 		if err := encoder.Encode(e); err != nil {
-			return err
+			if errors.Is(err, syscall.EPIPE) {
+				brokenPipe.Store(true)
+			}
+			return fmt.Errorf("event output: %w", err)
 		}
 		if e.Type == "ready" {
 			return notifyReady()
 		}
 		return nil
 	})
+	if brokenPipe.Load() {
+		if err == nil {
+			err = errors.New("event output closed (SIGPIPE)")
+		} else {
+			err = fmt.Errorf("%w (event output closed)", err)
+		}
+	}
+	return err
+}
+
+// groupID accepts a group name or a numeric ID, including an ID with no entry.
+func groupID(group string) (int, error) {
+	if gid, err := strconv.Atoi(group); err == nil && gid >= 0 {
+		return gid, nil
+	}
+	g, err := user.LookupGroup(group)
+	if err != nil {
+		if g, err = user.LookupGroupId(group); err != nil {
+			return 0, err
+		}
+	}
+	return strconv.Atoi(g.Gid)
 }
 
 // notifyReady also permits direct command-line use without systemd.

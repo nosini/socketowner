@@ -149,7 +149,7 @@ func mappedName(data []uint16, size uint32) (string, error) {
 		raw = append(raw, byte(w), byte(w>>8))
 	}
 	name := string(raw[:size])
-	if !utf8.ValidString(name) || strings.ContainsAny(name, "\x00/\\") {
+	if !utf8.ValidString(name) || strings.ContainsAny(name, "\x00/\\") || name == "." || name == ".." {
 		return "", errors.New("invalid mapped name")
 	}
 	return name, nil
@@ -177,8 +177,13 @@ func windowsImage(data []uint16, size uint32) (string, string, error) {
 		}
 	}
 	s := strings.ReplaceAll(string(utf16.Decode(w)), "/", `\`)
-	s = strings.TrimPrefix(strings.TrimPrefix(s, `\??\`), `\\?\`)
-	if strings.HasPrefix(s, `UNC\`) {
+	stripped := false
+	if t := strings.TrimPrefix(s, `\??\`); t != s {
+		s, stripped = t, true
+	} else if t := strings.TrimPrefix(s, `\\?\`); t != s {
+		s, stripped = t, true
+	}
+	if stripped && strings.HasPrefix(s, `UNC\`) {
 		s = `\\` + s[4:]
 	}
 	drive := len(s) >= 3 && (s[0] >= 'A' && s[0] <= 'Z' || s[0] >= 'a' && s[0] <= 'z') && s[1:3] == `:\`

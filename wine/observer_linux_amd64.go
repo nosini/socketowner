@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -22,6 +23,29 @@ import (
 )
 
 const scanInterval = 500 * time.Millisecond
+
+// lsmPath lists the active Linux security modules.
+const lsmPath = "/sys/kernel/security/lsm"
+
+// checkBPFLSM refuses a host where the BPF LSM is built but not active. The
+// observer's capture depends on LSM hooks, so attaching them would report
+// ready while no Wine identity was ever recorded.
+func checkBPFLSM() error {
+	return checkBPFLSMAt(lsmPath)
+}
+
+func checkBPFLSMAt(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("check BPF LSM: %w", err)
+	}
+	for _, name := range strings.Split(string(data), ",") {
+		if strings.TrimSpace(name) == "bpf" {
+			return nil
+		}
+	}
+	return fmt.Errorf("BPF LSM is not active (\"bpf\" missing from %s); the Wine observer cannot record identities", path)
+}
 
 type observerConfig struct {
 	HostNetNS uint64
@@ -66,6 +90,9 @@ func hostNetNS() (uint64, error) {
 func Observe(ctx context.Context, options Options, consume func(Event) error) error {
 	if options.Cgroup == "" || consume == nil {
 		return errors.New("explicit cgroup and event consumer required")
+	}
+	if err := checkBPFLSM(); err != nil {
+		return err
 	}
 	var instance [16]byte
 	if _, err := rand.Read(instance[:]); err != nil {
@@ -124,11 +151,25 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 	}
 	defer rd.Close()
 	var published *publication
+	var beatDone <-chan error
 	if options.Pin != "" {
 		if published, err = publish(coll, options.Pin, options.Group); err != nil {
 			return err
 		}
+		// The heartbeat is independent of event output: a blocked stdout
+		// must not make every flow look stale.
+		beatCtx, stopBeat := context.WithCancel(ctx)
+		beats := make(chan error, 1)
+		beatDone = beats
+		go func() {
+			defer close(beats)
+			beats <- runHeartbeat(beatCtx, beatInterval, published.ensurePins)
+		}()
 		defer published.close()
+		defer func() {
+			stopBeat()
+			<-beats
+		}()
 	}
 	if err := consume(Event{Type: "ready"}); err != nil {
 		return err
@@ -137,11 +178,11 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 	var reportedLosses uint64
 	var scanned time.Time
 	for {
+		if err := pollHeartbeat(beatDone); err != nil {
+			return err
+		}
 		if ctx.Err() != nil {
 			return consume(Event{Type: "stopped", Reason: "cancelled"})
-		}
-		if err := published.beat(); err != nil {
-			return err
 		}
 		if len(pasta.waiting) != 0 && time.Since(scanned) >= scanInterval {
 			scanned = time.Now()
@@ -181,5 +222,17 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 				return err
 			}
 		}
+	}
+}
+
+func pollHeartbeat(done <-chan error) error {
+	if done == nil {
+		return nil
+	}
+	select {
+	case err := <-done:
+		return err
+	default:
+		return nil
 	}
 }

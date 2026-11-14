@@ -13,6 +13,7 @@ func TestWindowsImage(t *testing.T) {
 		{`\??\C:\Program Files\Browser\tbs_browser.exe`, `C:\Program Files\Browser\tbs_browser.exe`, `tbs_browser.exe`},
 		{`\\?\C:\ゲーム\app.exe`, `C:\ゲーム\app.exe`, `app.exe`},
 		{`\??\UNC\server\share\app.exe`, `\\server\share\app.exe`, `app.exe`},
+		{`\\?\UNC\server\share\app.exe`, `\\server\share\app.exe`, `app.exe`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := utf16.Encode([]rune(tc.input))
@@ -22,7 +23,7 @@ func TestWindowsImage(t *testing.T) {
 			}
 		})
 	}
-	for _, s := range []string{"app.exe", `C:app.exe`, `C:\`, "C:\\a\x00b.exe"} {
+	for _, s := range []string{"app.exe", `C:app.exe`, `C:\`, "C:\\a\x00b.exe", `UNC\server\share\app.exe`} {
 		w := utf16.Encode([]rune(s))
 		if _, _, err := windowsImage(w, uint32(len(w)*2)); err == nil {
 			t.Fatalf("accepted %q", s)
@@ -126,6 +127,12 @@ func TestDecodeMappedName(t *testing.T) {
 	r.Owner.Image[0] = 'a' | '/'<<8
 	if _, err := mappedName(r.Owner.Image[:], 9); err == nil {
 		t.Fatal("name with a directory accepted")
+	}
+	r.Owner.Image[0] = '.' | '.'<<8
+	for _, size := range []uint32{1, 2} {
+		if _, err := mappedName(r.Owner.Image[:], size); err == nil {
+			t.Fatalf("dot name of %d bytes accepted", size)
+		}
 	}
 }
 

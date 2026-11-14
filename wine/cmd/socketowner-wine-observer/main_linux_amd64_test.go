@@ -3,9 +3,20 @@ package main
 import (
 	"net"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
+
+func TestGroupIDNumeric(t *testing.T) {
+	const want = 424242
+	if gid, err := groupID(strconv.Itoa(want)); err != nil || gid != want {
+		t.Fatalf("numeric group: %d, %v", gid, err)
+	}
+	if _, err := groupID("socketowner-no-such-group"); err == nil {
+		t.Fatal("accepted a missing group name")
+	}
+}
 
 func TestNotifyReady(t *testing.T) {
 	t.Setenv("NOTIFY_SOCKET", "")

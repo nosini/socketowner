@@ -32,6 +32,8 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -55,6 +57,9 @@ const sockMapName = "sock_owners"
 
 // The exec-path maps, which mihomo looks for next to mapName.
 var execMapNames = []string{"exec_tasks", "exec_recent"}
+
+// The maps the loader publishes in the shared maps directory.
+var loaderMapNames = append([]string{mapName, abiVersionMap}, execMapNames...)
 
 // The LSM programs in the exec-path object; seed_tasks is run, not attached.
 var execPrograms = []string{"record_exec", "record_fork", "record_free", "record_send", "record_connect"}
@@ -95,6 +100,9 @@ func lookupGroup(group string) (int, error) {
 	if group == "" {
 		return -1, nil
 	}
+	if gid, err := strconv.Atoi(group); err == nil && gid >= 0 {
+		return gid, nil
+	}
 	g, err := user.LookupGroup(group)
 	if err != nil {
 		if g, err = user.LookupGroupId(group); err != nil {
@@ -102,6 +110,29 @@ func lookupGroup(group string) (int, error) {
 		}
 	}
 	return strconv.Atoi(g.Gid)
+}
+
+// lsmPath lists the active Linux security modules.
+const lsmPath = "/sys/kernel/security/lsm"
+
+// checkBPFLSM refuses a host where the BPF LSM is built but not active: the
+// exec-path hooks would attach, yet never run, while the iterator would still
+// seed their maps.
+func checkBPFLSM() error {
+	return checkBPFLSMAt(lsmPath)
+}
+
+func checkBPFLSMAt(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("check BPF LSM: %w", err)
+	}
+	for _, name := range strings.Split(string(data), ",") {
+		if strings.TrimSpace(name) == "bpf" {
+			return nil
+		}
+	}
+	return fmt.Errorf("BPF LSM is not active (\"bpf\" missing from %s); -exec-paths would record nothing", path)
 }
 
 func nativeObject(le, be []byte) []byte {
@@ -128,6 +159,11 @@ func load(object []byte, maps map[string]*ebpf.Map, execPaths bool) (*ebpf.Colle
 }
 
 func attach(cgroup, pin string, execPaths bool, gid int) error {
+	if execPaths {
+		if err := checkBPFLSM(); err != nil {
+			return err
+		}
+	}
 	spec, coll, err := load(nativeObject(objectLE, objectBE), nil, false)
 	if err != nil {
 		return err
@@ -184,12 +220,11 @@ func attach(cgroup, pin string, execPaths bool, gid int) error {
 
 	// Pinned last: mihomo looks for the version and exec-path maps when it notices a
 	// new socket-owner map.
-	mapPath := filepath.Join(maps, mapName)
-	if err := coll.Maps[mapName].Pin(mapPath); err != nil {
+	if err := pinMap(coll.Maps[mapName], maps, mapName, 0o440, gid); err != nil {
 		detach(pin)
 		return fmt.Errorf("pin %s: %w", mapName, err)
 	}
-	return setReader(mapPath, 0o440, gid)
+	return nil
 }
 
 // makePinDirs creates the directories for the links and maps in pin and
@@ -252,16 +287,35 @@ func attachExec(coll *ebpf.Collection, links, maps string, gid int) error {
 	}
 
 	for _, name := range execMapNames {
-		path := filepath.Join(maps, name)
-		if err := coll.Maps[name].Pin(path); err != nil {
+		if err := pinMap(coll.Maps[name], maps, name, 0o440, gid); err != nil {
 			return fmt.Errorf("pin %s: %w", name, err)
-		}
-		if err := setReader(path, 0o440, gid); err != nil {
-			return err
 		}
 	}
 	return nil
 }
+
+// pinMap publishes m under dir/name with its final owner and mode. It pins
+// under an exclusive temporary name first, so a reader never sees the new
+// inode before setReader has made it readable.
+func pinMap(m *ebpf.Map, dir, name string, mode os.FileMode, gid int) (err error) {
+	final := filepath.Join(dir, name)
+	tmp := filepath.Join(dir, fmt.Sprintf("%s-pin-%d-%d", name, os.Getpid(), pinSeq.Add(1)))
+	os.Remove(tmp)
+	if err := m.Pin(tmp); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			os.Remove(tmp)
+		}
+	}()
+	if err := setReader(tmp, mode, gid); err != nil {
+		return err
+	}
+	return os.Rename(tmp, final)
+}
+
+var pinSeq atomic.Uint64
 
 // setReader gives path to the loader's user and to gid, or the loader's group
 // if gid is -1, with mode. It also takes back a path that an earlier version
@@ -276,9 +330,9 @@ func setReader(path string, mode os.FileMode, gid int) error {
 	return os.Chmod(path, mode)
 }
 
-// detach removes the pins in the links and maps directories but keeps the
-// directories. Unpinning the links detaches the programs once nothing else
-// holds them.
+// detach removes the loader's pins in the links and maps directories but
+// keeps the directories. Unpinning the links detaches the programs once
+// nothing else holds them. Wine observer pins in maps are left alone.
 func detach(pin string) error {
 	for _, dir := range []string{"links", "maps"} {
 		dir = filepath.Join(pin, dir)
@@ -289,10 +343,24 @@ func detach(pin string) error {
 			return err
 		}
 		for _, e := range entries {
+			if dir == filepath.Join(pin, "maps") && !loaderPin(e.Name()) {
+				continue
+			}
 			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// loaderPin reports whether name is one of the loader's maps, or a temporary
+// pin left by an interrupted publication.
+func loaderPin(name string) bool {
+	for _, own := range loaderMapNames {
+		if name == own || strings.HasPrefix(name, own+"-pin-") {
+			return true
+		}
+	}
+	return false
 }

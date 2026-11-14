@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/cilium/ebpf"
 )
@@ -56,8 +57,5 @@ func pinABIVersion(path string, gid int) error {
 	if err := m.Freeze(); err != nil {
 		return err
 	}
-	if err := m.Pin(path); err != nil {
-		return err
-	}
-	return setReader(path, 0o440, gid)
+	return pinMap(m, filepath.Dir(path), filepath.Base(path), 0o440, gid)
 }
