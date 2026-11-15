@@ -20,22 +20,18 @@ type pastaTarget struct {
 	Pad    uint32
 }
 
-// process identifies a process across PID reuse.
-type process struct {
-	pid   int
-	start uint64
-}
-
 // relays finds the pasta of each sandbox whose wineserver appeared. Nothing is
 // read from pasta's memory, so no build matters: registration only says that
 // sockets it connects stand in for flows from that network namespace.
 type relays struct {
 	waiting map[int]*waitingServer
-	// find, register and start are the process lookups and the pasta_targets
-	// update, but for tests.
+	// find, register, open, alive and closeFd are the process lookups, the
+	// pasta_targets update and their pidfd handling, but for tests.
 	find     func(server int) (pid, pidfd int, err error)
 	register func(pidfd int, netns uint64) error
-	start    func(pid int) (uint64, error)
+	open     func(pid int) (int, error)
+	alive    func(pidfd int) bool
+	closeFd  func(pidfd int)
 	logf     func(format string, args ...any)
 	reported map[string]bool
 }
@@ -43,13 +39,16 @@ type relays struct {
 // waitingServer is retried less often the longer no pasta appears: a sandbox may
 // have no network or use another relay, and each scan walks all of /proc. Once
 // a pasta is registered it stays on the list, so a replacement is found after
-// the old one exits. start identifies the wineserver across PID reuse.
+// the old one exits. serverFd identifies the wineserver and pastaFd the
+// registered pasta across PID reuse: a PID number can be reused while its pidfd
+// is still held, so only liveness of that fd tells them apart.
 type waitingServer struct {
-	start uint64
-	netns uint64
-	next  time.Time
-	delay time.Duration
-	pasta process
+	serverFd int
+	netns    uint64
+	next     time.Time
+	delay    time.Duration
+	pastaPid int
+	pastaFd  int
 }
 
 const (
@@ -65,7 +64,9 @@ func newRelays(targets *ebpf.Map) *relays {
 	return &relays{
 		waiting:  map[int]*waitingServer{},
 		find:     findPasta,
-		start:    processStart,
+		open:     func(pid int) (int, error) { return unix.PidfdOpen(pid, 0) },
+		alive:    alive,
+		closeFd:  func(pidfd int) { unix.Close(pidfd) },
 		logf:     log.Printf,
 		reported: map[string]bool{},
 		register: func(pidfd int, netns uint64) error {
@@ -81,26 +82,44 @@ func newRelays(targets *ebpf.Map) *relays {
 	}
 }
 
+// add records a wineserver seen now. The pidfd pins the process it names, so a
+// later PID reuse does not mistake a successor for it.
 func (r *relays) add(server int, netns uint64, now time.Time) {
-	start, err := r.startProcess(server)
+	fd, err := r.open(server)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			r.report(fmt.Errorf("wineserver %d: %w", server, err))
+		if errors.Is(err, unix.ESRCH) || errors.Is(err, unix.ENOENT) {
+			return
 		}
+		r.report(fmt.Errorf("wineserver %d: %w", server, err))
 		return
 	}
-	if w := r.waiting[server]; w != nil && w.start == start {
-		w.netns = netns
-		return
+	if w := r.waiting[server]; w != nil {
+		if r.alive(w.serverFd) {
+			w.netns = netns
+			r.closeFd(fd)
+			return
+		}
+		r.drop(w)
 	}
-	r.waiting[server] = &waitingServer{start: start, netns: netns, next: now, delay: scanInterval}
+	r.waiting[server] = &waitingServer{serverFd: fd, netns: netns, next: now, delay: scanInterval}
 }
 
-func (r *relays) startProcess(pid int) (uint64, error) {
-	if r.start == nil {
-		return 0, nil
+// drop releases the pidfds an entry holds. pastaPid is set exactly when a pasta
+// fd is held, so a zero entry never closes fd 0.
+func (r *relays) drop(w *waitingServer) {
+	r.closeFd(w.serverFd)
+	if w.pastaPid != 0 {
+		r.closeFd(w.pastaFd)
+		w.pastaPid, w.pastaFd = 0, 0
 	}
-	return r.start(pid)
+}
+
+// close releases every held pidfd.
+func (r *relays) close() {
+	for server, w := range r.waiting {
+		r.drop(w)
+		delete(r.waiting, server)
+	}
 }
 
 func (r *relays) report(err error) {
@@ -147,27 +166,6 @@ func findPasta(server int) (int, int, error) {
 	return 0, -1, nil
 }
 
-// processStart reads the start time from /proc/<pid>/stat, whose field 22 can
-// be compared with a later PID's. The command name may contain spaces and
-// parentheses, so fields are counted after its last ')'.
-func processStart(pid int) (uint64, error) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return 0, err
-	}
-	text := string(data)
-	end := strings.LastIndexByte(text, ')')
-	if end < 0 {
-		return 0, errors.New("invalid process stat")
-	}
-	fields := strings.Fields(text[end+1:])
-	const startField = 22 - 3 // fields after the command name start at field 3
-	if len(fields) <= startField {
-		return 0, errors.New("invalid process stat")
-	}
-	return strconv.ParseUint(fields[startField], 10, 64)
-}
-
 func isPasta(pid int) bool {
 	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	return err == nil && strings.Contains(filepath.Base(exe), "pasta")
@@ -203,33 +201,25 @@ func alive(pidfd int) bool {
 	return false
 }
 
-// scan registers the pastas found now. A sandbox with no pasta is retried, with
-// growing delays, for as long as its wineserver lives. A registered pasta is
-// checked again so that a replacement joining the same namespace is registered
-// too. Registration keeps nothing but the task storage entry, keyed by pidfd
-// and revoked on exec.
+// scan registers the pastas found now. An entry whose wineserver fd is no longer
+// alive is forgotten first. A sandbox with no pasta is retried, with growing
+// delays, for as long as its wineserver lives. A registered pasta is checked
+// again, so that a replacement joining the same namespace is registered too.
+// Registration keeps nothing but the task storage entry, keyed by pidfd and
+// revoked on exec.
 func (r *relays) scan(now time.Time, consume func(Event) error) error {
 	for server, w := range r.waiting {
+		if !r.alive(w.serverFd) {
+			r.drop(w)
+			delete(r.waiting, server)
+			continue
+		}
 		if now.Before(w.next) {
-			continue
-		}
-		start, err := r.startProcess(server)
-		if errors.Is(err, os.ErrNotExist) {
-			delete(r.waiting, server)
-			continue
-		}
-		if err != nil {
-			r.report(fmt.Errorf("wineserver %d: %w", server, err))
-			w.next = now.Add(w.delay)
-			w.delay = min(2*w.delay, maxScanDelay)
-			continue
-		}
-		if start != w.start {
-			delete(r.waiting, server)
 			continue
 		}
 		pid, pidfd, err := r.find(server)
 		if errors.Is(err, os.ErrNotExist) {
+			r.drop(w)
 			delete(r.waiting, server)
 			continue
 		}
@@ -239,43 +229,41 @@ func (r *relays) scan(now time.Time, consume func(Event) error) error {
 			w.delay = min(2*w.delay, maxScanDelay)
 			continue
 		}
+		// No pasta was found. A held pasta fd which is still alive keeps the
+		// registration: it could only have been missed, not replaced.
 		if pid == 0 {
-			w.pasta = process{}
 			w.next = now.Add(w.delay)
 			w.delay = min(2*w.delay, maxScanDelay)
 			continue
 		}
-		// The pidfd keeps the PID from being reused while its start time is read.
-		start, err = r.startProcess(pid)
-		if err != nil {
-			unix.Close(pidfd)
-			w.pasta = process{}
-			w.next = now.Add(w.delay)
-			w.delay = min(2*w.delay, maxScanDelay)
-			continue
-		}
-		proc := process{pid: pid, start: start}
-		if proc == w.pasta {
-			unix.Close(pidfd)
+		if pid == w.pastaPid && r.alive(w.pastaFd) {
+			r.closeFd(pidfd)
 			w.next = now.Add(w.delay)
 			w.delay = min(2*w.delay, registeredMaxDelay)
 			continue
 		}
 		err = r.register(pidfd, w.netns)
-		unix.Close(pidfd)
 		if err == nil {
-			w.pasta = proc
+			oldFd, oldPid := w.pastaFd, w.pastaPid
+			w.pastaPid, w.pastaFd = pid, pidfd
+			if oldPid != 0 {
+				r.closeFd(oldFd)
+			}
 			w.delay = scanInterval
 			w.next = now.Add(w.delay)
-			if err := consume(Event{Type: "pasta", ServerTGID: uint32(server), PastaTGID: uint32(proc.pid), NetNS: w.netns}); err != nil {
+			if err := consume(Event{Type: "pasta", ServerTGID: uint32(server), PastaTGID: uint32(pid), NetNS: w.netns}); err != nil {
 				return err
 			}
 			continue
 		}
+		r.closeFd(pidfd)
 		if !errors.Is(err, errPastaGone) {
 			return err
 		}
-		w.pasta = process{}
+		if w.pastaPid != 0 {
+			r.closeFd(w.pastaFd)
+			w.pastaPid, w.pastaFd = 0, 0
+		}
 		w.delay = scanInterval
 		w.next = now.Add(w.delay)
 	}
