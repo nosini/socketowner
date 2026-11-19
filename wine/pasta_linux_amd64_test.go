@@ -65,13 +65,14 @@ func (f *fakeFds) leaked() []int {
 func testRelays(t *testing.T, fds *fakeFds, find func(int) (int, int, error)) *relays {
 	t.Helper()
 	r := &relays{
-		waiting:  map[int]*waitingServer{},
-		find:     find,
-		open:     fds.open,
-		alive:    fds.isAlive,
-		closeFd:  fds.close,
-		logf:     func(string, ...any) {},
-		reported: map[string]bool{},
+		waiting:    map[int]*waitingServer{},
+		find:       find,
+		registered: func(int, uint64) bool { return true },
+		open:       fds.open,
+		alive:      fds.isAlive,
+		closeFd:    fds.close,
+		logf:       func(string, ...any) {},
+		reported:   map[string]bool{},
 	}
 	t.Cleanup(func() {
 		r.close()
@@ -230,6 +231,49 @@ func TestScanRegistersReplacementPasta(t *testing.T) {
 	}
 	if leaked := fds.leaked(); len(leaked) != 2 {
 		t.Fatalf("fds %v left open", leaked)
+	}
+}
+
+// exec revokes a pasta's registration but leaves its pidfd alive. A pasta that
+// exec'd, possibly while a scan missed it, and is found again under the same
+// PID must be registered again.
+func TestScanReregistersExecedPasta(t *testing.T) {
+	registrations := 0
+	active := map[int]bool{}
+	var events []Event
+	fds := newFakeFds()
+	r := testRelays(t, fds, func(int) (int, int, error) {
+		pidfd, err := fds.open(20)
+		return 20, pidfd, err
+	})
+	r.register = func(pidfd int, netns uint64) error {
+		registrations++
+		active[pidfd] = true
+		return nil
+	}
+	r.registered = func(pidfd int, netns uint64) bool { return active[pidfd] && netns == 7 }
+	consume := func(e Event) error { events = append(events, e); return nil }
+	start := time.Now()
+	r.add(10, 7, start)
+	if err := r.scan(start, consume); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.scan(start.Add(scanInterval), consume); err != nil {
+		t.Fatal(err)
+	}
+	if registrations != 1 {
+		t.Fatalf("active pasta registered again: registrations %d", registrations)
+	}
+	held := r.waiting[10].pastaFd
+	active[held] = false
+	if err := r.scan(start.Add(time.Minute), consume); err != nil {
+		t.Fatal(err)
+	}
+	if registrations != 2 || len(events) != 2 || events[1].PastaTGID != 20 {
+		t.Fatalf("exec'd pasta not registered again: registrations %d, events %+v", registrations, events)
+	}
+	if now := r.waiting[10].pastaFd; now == held || fds.isOpen(held) || !fds.isOpen(now) {
+		t.Fatalf("pasta fd %d not replaced by %d", held, now)
 	}
 }
 

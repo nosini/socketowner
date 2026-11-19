@@ -243,7 +243,8 @@ observer then looks for the sandbox's pasta: a process outside that namespace,
 holding a descriptor for it, whose executable name contains `pasta`. A failed
 lookup is logged and retried; it does not stop the observer. Registration is
 keyed by pidfd and revoked on exec. A registered sandbox is checked again, so a
-pasta that replaces the previous one is registered too. No pasta memory is read,
+pasta that replaces the previous one, or that exec'd and lost its registration, is
+registered again. No pasta memory is read,
 so its updates don't matter. A flow pasta connects before that registration has
 no record, and shows as pasta; this did not occur in testing, but nothing
 prevents it.

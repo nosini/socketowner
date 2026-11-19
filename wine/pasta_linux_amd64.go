@@ -25,15 +25,17 @@ type pastaTarget struct {
 // sockets it connects stand in for flows from that network namespace.
 type relays struct {
 	waiting map[int]*waitingServer
-	// find, register, open, alive and closeFd are the process lookups, the
-	// pasta_targets update and their pidfd handling, but for tests.
-	find     func(server int) (pid, pidfd int, err error)
-	register func(pidfd int, netns uint64) error
-	open     func(pid int) (int, error)
-	alive    func(pidfd int) bool
-	closeFd  func(pidfd int)
-	logf     func(format string, args ...any)
-	reported map[string]bool
+	// find, register, registered, open, alive and closeFd are the process
+	// lookups, the pasta_targets update and lookup and their pidfd handling,
+	// but for tests.
+	find       func(server int) (pid, pidfd int, err error)
+	register   func(pidfd int, netns uint64) error
+	registered func(pidfd int, netns uint64) bool
+	open       func(pid int) (int, error)
+	alive      func(pidfd int) bool
+	closeFd    func(pidfd int)
+	logf       func(format string, args ...any)
+	reported   map[string]bool
 }
 
 // waitingServer is retried less often the longer no pasta appears: a sandbox may
@@ -78,6 +80,12 @@ func newRelays(targets *ebpf.Map) *relays {
 				return fmt.Errorf("register pasta: %w", err)
 			}
 			return nil
+		},
+		// exec clears Active without closing the pidfd, so a live pasta fd
+		// doesn't show that its registration still holds.
+		registered: func(pidfd int, netns uint64) bool {
+			var t pastaTarget
+			return targets.Lookup(int32(pidfd), &t) == nil && t.Active != 0 && t.NetNS == netns
 		},
 	}
 }
@@ -206,7 +214,8 @@ func alive(pidfd int) bool {
 // delays, for as long as its wineserver lives. A registered pasta is checked
 // again, so that a replacement joining the same namespace is registered too.
 // Registration keeps nothing but the task storage entry, keyed by pidfd and
-// revoked on exec.
+// revoked on exec. A pasta found again under the same pidfd is registered again
+// unless that entry is still active, since it may have exec'd in between.
 func (r *relays) scan(now time.Time, consume func(Event) error) error {
 	for server, w := range r.waiting {
 		if !r.alive(w.serverFd) {
@@ -236,7 +245,7 @@ func (r *relays) scan(now time.Time, consume func(Event) error) error {
 			w.delay = min(2*w.delay, maxScanDelay)
 			continue
 		}
-		if pid == w.pastaPid && r.alive(w.pastaFd) {
+		if pid == w.pastaPid && r.alive(w.pastaFd) && r.registered(w.pastaFd, w.netns) {
 			r.closeFd(pidfd)
 			w.next = now.Add(w.delay)
 			w.delay = min(2*w.delay, registeredMaxDelay)
