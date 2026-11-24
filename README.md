@@ -43,6 +43,11 @@ plus `CAP_CHOWN` for `-reader-group` and `CAP_PERFMON` for `-exec-paths`. The
 loader exits after attach; pinned links keep the programs running. If attaching
 fails after any program is attached, it removes its pins.
 
+The loader also records the cgroup of each connection's owner, which lets mihomo
+route by Flatpak app (`FLATPAK-APP` rules) or systemd unit. Like a process name,
+a cgroup name is chosen by the user's own processes: it identifies cooperative
+applications and is not a security boundary.
+
 Point mihomo's `find-process-bpf-map` at `maps/conn_owners` inside the pin directory
 (or its read-only bind mount). Set `find-process-bpf-only: true` with `-exec-paths`
 to prevent fallback to `/proc`. An unprivileged reader needs directory traversal
@@ -60,9 +65,11 @@ the loader's pins and leaves Wine observer pins in place.
 
 ## Compatibility and updates
 
-This loader publishes [map interface v1](docs/map-interface.md). Update it
-independently from mihomo, keeping a version whose map interface the reader
-supports. Installing mihomo must not build, install or replace this privileged
+This loader publishes [map interface v1](docs/map-interface.md), with the
+optional owner-cgroup map. Update it independently from mihomo, keeping a version
+whose map interface the reader supports. A mihomo that knows `FLATPAK-APP`
+still works with an older loader, but those rules never match until the loader
+is updated. Installing mihomo must not build, install or replace this privileged
 executable. A loader update takes effect when its service is restarted.
 
 See [development](docs/development.md) for source builds and tests.

@@ -2,7 +2,8 @@
 
 // Records which process owns each outgoing TCP/UDP flow, so that mihomo can
 // match PROCESS-NAME and PROCESS-PATH rules after the socket has gone away and
-// without scanning /proc.
+// without scanning /proc. The owner's cgroup v2 ID goes in conn_cgroups, which
+// lets mihomo name the systemd unit or Flatpak app behind a flow.
 //
 // The cgroup socket hooks run in the context of the process that creates,
 // connects or sends on a socket and remember it in socket-local storage. The
@@ -44,6 +45,14 @@ struct {
 	__type(key, struct conn_key);
 	__type(value, struct conn_owner);
 } conn_owners SEC(".maps");
+
+// The owner's cgroup for each key of conn_owners, published at the same time.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct conn_key);
+	__type(value, struct conn_cgroup);
+} conn_cgroups SEC(".maps");
 
 SEC("cgroup/sock_create")
 int sock_create(struct bpf_sock *sk)
@@ -226,16 +235,26 @@ int egress(struct __sk_buff *skb)
 	if (packet_source_port(skb, version, key.proto, &key.port))
 		return 1;
 
-	// Check the map on every packet rather than remembering what this
+	// Check the maps on every packet rather than remembering what this
 	// socket published: the source address and port can change (a UDP
 	// socket that disconnects is bound again on its next send), and the
-	// entry may have been evicted. The lookup also keeps the entry of an
-	// active flow recently used.
+	// entries may have been evicted, each map on its own. The lookups also
+	// keep the entries of an active flow recently used.
 	struct conn_owner *published = bpf_map_lookup_elem(&conn_owners, &key);
-	if (published &&
-	    !__builtin_memcmp(published, &so->owner, sizeof(so->owner)))
-		return 1;
-	bpf_map_update_elem(&conn_owners, &key, &so->owner, BPF_ANY);
+	if (!published ||
+	    __builtin_memcmp(published, &so->owner, sizeof(so->owner)))
+		bpf_map_update_elem(&conn_owners, &key, &so->owner, BPF_ANY);
+
+	// An unowned socket publishes an empty record here too, so a stale
+	// cgroup is never taken for its own.
+	struct conn_cgroup cg = {
+		.tgid = so->owner.tgid,
+		.boot_ns = so->owner.boot_ns,
+		.cgroup_id = so->owner.tgid ? so->cgroup_id : 0,
+	};
+	struct conn_cgroup *cg_published = bpf_map_lookup_elem(&conn_cgroups, &key);
+	if (!cg_published || __builtin_memcmp(cg_published, &cg, sizeof(cg)))
+		bpf_map_update_elem(&conn_cgroups, &key, &cg, BPF_ANY);
 	return 1;
 }
 

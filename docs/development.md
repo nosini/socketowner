@@ -9,6 +9,9 @@ On Linux, mihomo can look up the process behind a connection in BPF maps instead
   and user ID in the `conn_owners` LRU map, keyed by network namespace, protocol, source
   address and source port, both read from the packet after any NAT translation. Socket
   ports can differ when redirection remaps a port to avoid a collision at its listener.
+  The same hooks record the process's cgroup v2 ID (`bpf_get_current_cgroup_id`), which the
+  egress hook publishes in `conn_cgroups` under the same key, together with the owner it
+  belongs to; key 1 of `abi_version` advertises that map.
   The cgroup hooks don't see sends on a connected socket, so with
   `-exec-paths` LSM programs in `execpath.c` record those. Without it, a connected socket
   that a process hands to another stays with the process that connected it.
@@ -82,6 +85,12 @@ It forces source-port collisions at a redirect listener and checks that the tran
 TCP and UDP peers resolve to the sending process, for IPv4 and IPv6. TCP cases also
 cover IPv4 options and IPv6 destination options. The packet parser skips noninitial
 fragments and supports chains of up to eight IPv6 extension headers.
+
+`-test.run Cgroup` checks that a flow is published with the sending process's cgroup
+and the owner it belongs to, that a move to another cgroup is seen on the next send
+(on a connected socket only through the `-exec-paths` hooks, which attach to the whole
+system), and that an accepted socket replaces a stale cgroup record with an empty one.
+`TestABIFeatures` checks the feature bit.
 
 In a separate mihomo checkout, `component/process/sockowner_vm_test.go` compares
 the BPF lookup with the `/proc` lookup. It needs the programs attached (with

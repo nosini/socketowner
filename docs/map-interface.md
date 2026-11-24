@@ -16,19 +16,24 @@ mode 0440. Owning a pin would let a reader grant itself write access.
 | --- | --- | ---: | ---: | --- |
 | `abi_version` | `BPF_MAP_TYPE_ARRAY` (2) | 4 | 4 | Required; one entry |
 | `conn_owners` | `BPF_MAP_TYPE_LRU_HASH` (9) | 32 | 16 | Required |
+| `conn_cgroups` | `BPF_MAP_TYPE_LRU_HASH` (9) | 32 | 24 | With feature bit 0 |
 | `exec_tasks` | `BPF_MAP_TYPE_TASK_STORAGE` (29) | 4 | 1048 | With `-exec-paths` |
 | `exec_recent` | `BPF_MAP_TYPE_LRU_HASH` (9) | 4 | 1048 | With `-exec-paths` |
 
 The `abi_version` entry at native-endian uint32 key 0 is native-endian uint32
-value 1. The loader freezes this map before pinning it. Readers must reject a
+value 1. Key 1, when present, holds a native-endian uint32 bitmask of optional
+features: bit 0 means `conn_cgroups` is published. Loaders that predate the
+feature mask have only key 0, and a lookup of key 1 fails; treat that as no
+features. Readers must ignore feature bits they don't know. The loader freezes
+this map before pinning it. Readers must reject a
 missing marker or an unsupported version before interpreting connection records.
 They must also check the type, key size and value size of every map before
 performing any lookup; a larger kernel value would overflow a smaller userspace
 buffer. Open maps with `BPF_F_RDONLY` and close-on-exec descriptors.
 
-Attach replaces previous links and pins in the same directories. Optional maps
-and the version marker are pinned before `conn_owners`, which is the publication
-point. Each pin appears under its documented name only with its final owner and
+Attach replaces previous links and pins in the same directories. Optional maps,
+`conn_cgroups` and the version marker are pinned before `conn_owners`, which is
+the publication point. Each pin appears under its documented name only with its final owner and
 mode, so a reader that opens one of these paths never finds it unreadable.
 Readers should reopen all maps when that pin's inode changes and retry
 unavailable optional maps. Detach removes the loader's pins but keeps the
@@ -103,6 +108,42 @@ running when `boot_ns` was recorded, so a `/proc/<pid>/stat` start time later th
 `boot_ns` (field 22, in `USER_HZ` ticks since boot, allowing for tick resolution)
 names a different process; such a reader must not use that process's executable.
 
+## Owner cgroups
+
+When feature bit 0 is set, `conn_cgroups` uses the connection key above and a
+24-byte value:
+
+| Byte offset | Type | Meaning |
+| ---: | --- | --- |
+| 0 | uint32 | Owner TGID this record belongs to; 0 means unknown |
+| 4 | uint32 | Zero padding |
+| 8 | uint64 | That owner's `boot_ns`, as in `conn_owners` |
+| 16 | uint64 | cgroup v2 ID of the owner when it was last recorded, or 0 |
+
+The egress hook publishes it together with `conn_owners`, under the same rules:
+kernel-generated packets change nothing, and a socket without a recorded owner
+publishes an all-zero record. The cgroup is the default-hierarchy cgroup of the
+process at the moment it last created, connected or sent on the socket (sends on
+connected sockets only with `-exec-paths`), so a process that moves to another
+cgroup is seen in the new one from its next such call on.
+
+The two maps are evicted independently and are updated one after the other, so
+a reader must look up `conn_owners` first and use the cgroup record only if its
+TGID and `boot_ns` equal those of the owner record. Any other combination,
+including a missing cgroup record or a TGID of 0, means the cgroup is unknown;
+it is never the cgroup of a different owner.
+
+A cgroup v2 ID is the inode number of the cgroup's directory in cgroupfs on
+64-bit kernels; IDs are not reused while the system runs. The ID only names the
+cgroup; resolving it to a path is up to the reader, and a cgroup removed before
+the lookup can no longer be resolved. A reader in a separate cgroup namespace,
+or one that doesn't see the host's cgroupfs, can't resolve IDs outside its view.
+
+cgroups are attribution, not authentication. A process can create cgroups in
+any subtree delegated to it, such as its systemd user manager's, give them any
+name and move itself into them. Treat a cgroup name like a process name: good
+enough to route a cooperative application, not a security boundary.
+
 ## Executable records
 
 Both executable maps use the same 1048-byte value:
@@ -166,6 +207,8 @@ rule and validation.
 ## Evolution
 
 Changes to names, layouts, byte order or record meaning require a new ABI version.
+An optional map that keeps every v1 guarantee is added with a new feature bit at
+key 1 of `abi_version` instead, as `conn_cgroups` was.
 A breaking version must also use a separate pin directory so a reader cannot mix
 old and new maps during replacement. Keep old ABI support explicitly if needed;
 never silently reinterpret v1 records. Extra private maps or optional features

@@ -41,6 +41,12 @@ func TestObjects(t *testing.T) {
 			checkStructABI(t, spec.Maps[mapName].Value, 16, []abiMember{
 				{"tgid", 0, 4}, {"uid", 4, 4}, {"boot_ns", 8, 8},
 			})
+			checkStructABI(t, spec.Maps[cgroupMapName].Key, 32, []abiMember{
+				{"netns", 0, 8}, {"addr", 8, 16}, {"port", 24, 2}, {"proto", 26, 1}, {"pad", 27, 5},
+			})
+			checkStructABI(t, spec.Maps[cgroupMapName].Value, 24, []abiMember{
+				{"tgid", 0, 4}, {"pad", 4, 4}, {"boot_ns", 8, 8}, {"cgroup_id", 16, 8},
+			})
 			want := map[string]ebpf.AttachType{
 				"sock_create": ebpf.AttachCGroupInetSockCreate,
 				"connect4":    ebpf.AttachCGroupInet4Connect,
@@ -171,7 +177,7 @@ func TestRejectIncompatibleMapABI(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		names := []string{mapName}
+		names := []string{mapName, cgroupMapName}
 		if execPaths {
 			names = execMapNames
 		}
@@ -282,7 +288,7 @@ func TestDetachKeepsWinePins(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	loader := []string{"links/sock_create", "maps/conn_owners", "maps/abi_version", "maps/exec_tasks", "maps/conn_owners-pin-12-1"}
+	loader := []string{"links/sock_create", "maps/conn_owners", "maps/conn_cgroups", "maps/abi_version", "maps/exec_tasks", "maps/conn_owners-pin-12-1"}
 	wine := []string{"maps/wine_flows", "maps/wine_heartbeat", "maps/wine_abi"}
 	for _, path := range append(loader, wine...) {
 		if err := os.WriteFile(filepath.Join(pin, path), nil, 0o600); err != nil {

@@ -14,6 +14,16 @@ const (
 	abiVersionMap        = "abi_version"
 )
 
+// Optional features of ABI v1, advertised at key 1 of the version map. A
+// loader that predates the key has none of them, and a reader finds the key
+// missing.
+const (
+	// conn_cgroups holds the owner's cgroup for each conn_owners key.
+	abiFeatureConnCgroups uint32 = 1 << 0
+
+	abiFeatures = abiFeatureConnCgroups
+)
+
 // validateMapABI checks the public maps before loading an embedded object.
 // The loader must only advertise the ABI its objects actually implement.
 func validateMapABI(spec *ebpf.CollectionSpec, execPaths bool) error {
@@ -22,7 +32,8 @@ func validateMapABI(spec *ebpf.CollectionSpec, execPaths bool) error {
 		key, value uint32
 	}
 	want := map[string]mapLayout{
-		mapName: {ebpf.LRUHash, 32, 16},
+		mapName:       {ebpf.LRUHash, 32, 16},
+		cgroupMapName: {ebpf.LRUHash, 32, 24},
 	}
 	if execPaths {
 		want = map[string]mapLayout{
@@ -39,16 +50,20 @@ func validateMapABI(spec *ebpf.CollectionSpec, execPaths bool) error {
 	return nil
 }
 
-// pinABIVersion publishes a frozen marker before conn_owners becomes visible.
-// Freeze prevents userspace from changing the advertised ABI after attach.
+// pinABIVersion publishes a frozen marker before conn_owners becomes visible:
+// the version at key 0 and the optional features at key 1. Freeze prevents
+// userspace from changing the advertised ABI after attach.
 func pinABIVersion(path string, gid int) error {
 	m, err := ebpf.NewMap(&ebpf.MapSpec{
 		Name:       abiVersionMap,
 		Type:       ebpf.Array,
 		KeySize:    4,
 		ValueSize:  4,
-		MaxEntries: 1,
-		Contents:   []ebpf.MapKV{{Key: uint32(0), Value: abiVersion}},
+		MaxEntries: 2,
+		Contents: []ebpf.MapKV{
+			{Key: uint32(0), Value: abiVersion},
+			{Key: uint32(1), Value: abiFeatures},
+		},
 	})
 	if err != nil {
 		return err

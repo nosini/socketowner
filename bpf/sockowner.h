@@ -17,12 +17,23 @@ struct conn_owner {
 	__u64 boot_ns; // CLOCK_BOOTTIME when the owner was recorded
 };
 
+// The cgroup of a connection's owner, published next to conn_owner. The two
+// maps evict independently, so the value repeats the owner it belongs to.
+struct conn_cgroup {
+	__u32 tgid;
+	__u32 pad;
+	__u64 boot_ns;
+	__u64 cgroup_id; // cgroup v2 ID (cgroupfs inode number), or 0
+};
+
 struct sock_owner {
 	struct conn_owner owner;
 	__u64 netns;
 	// The owner whose executable execpath.c saved in exec_recent last.
 	__u32 saved_tgid;
 	__u32 pad;
+	// The cgroup v2 of the process that last recorded itself as the owner.
+	__u64 cgroup_id;
 };
 
 struct {
@@ -39,11 +50,13 @@ static __always_inline int tracked_protocol(__u32 protocol)
 
 // Records the current process as the owner. Keeps the time of an owner that
 // is recorded again, which must stay before the process exits for mihomo to
-// accept it.
+// accept it. The cgroup is taken every time, since a process can move to
+// another cgroup, as flatpak run does when it starts the app's scope.
 static __always_inline void record_current(struct sock_owner *so)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 
+	so->cgroup_id = bpf_get_current_cgroup_id();
 	if (so->owner.tgid == tgid && so->owner.boot_ns)
 		return;
 	so->owner.tgid = tgid;

@@ -52,6 +52,9 @@ var (
 
 const mapName = "conn_owners"
 
+// The owners' cgroups, published with mapName under the same keys.
+const cgroupMapName = "conn_cgroups"
+
 // The socket storage that both objects record socket owners in.
 const sockMapName = "sock_owners"
 
@@ -59,7 +62,7 @@ const sockMapName = "sock_owners"
 var execMapNames = []string{"exec_tasks", "exec_recent"}
 
 // The maps the loader publishes in the shared maps directory.
-var loaderMapNames = append([]string{mapName, abiVersionMap}, execMapNames...)
+var loaderMapNames = append([]string{mapName, cgroupMapName, abiVersionMap}, execMapNames...)
 
 // The LSM programs in the exec-path object; seed_tasks is run, not attached.
 var execPrograms = []string{"record_exec", "record_fork", "record_free", "record_send", "record_connect"}
@@ -213,13 +216,18 @@ func attach(cgroup, pin string, execPaths bool, gid int) error {
 		}
 	}
 
+	if err := pinMap(coll.Maps[cgroupMapName], maps, cgroupMapName, 0o440, gid); err != nil {
+		detach(pin)
+		return fmt.Errorf("pin %s: %w", cgroupMapName, err)
+	}
+
 	if err := pinABIVersion(filepath.Join(maps, abiVersionMap), gid); err != nil {
 		detach(pin)
 		return fmt.Errorf("pin ABI version: %w", err)
 	}
 
-	// Pinned last: mihomo looks for the version and exec-path maps when it notices a
-	// new socket-owner map.
+	// Pinned last: mihomo looks for the version, cgroup and exec-path maps when it
+	// notices a new socket-owner map.
 	if err := pinMap(coll.Maps[mapName], maps, mapName, 0o440, gid); err != nil {
 		detach(pin)
 		return fmt.Errorf("pin %s: %w", mapName, err)
