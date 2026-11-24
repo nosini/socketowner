@@ -44,7 +44,8 @@ loader exits after attach; pinned links keep the programs running. If attaching
 fails after any program is attached, it removes its pins.
 
 The loader also records the cgroup of each connection's owner, which lets mihomo
-route by Flatpak app (`FLATPAK-APP` rules) or systemd unit. Like a process name,
+route by Flatpak app (`FLATPAK-APP` rules) or systemd unit. With `-exec-paths` it
+records the cgroups' paths too, so mihomo needn't read `/sys/fs/cgroup`. Like a process name,
 a cgroup name is chosen by the user's own processes: it identifies cooperative
 applications and is not a security boundary.
 

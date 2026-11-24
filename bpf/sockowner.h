@@ -34,6 +34,8 @@ struct sock_owner {
 	__u32 pad;
 	// The cgroup v2 of the process that last recorded itself as the owner.
 	__u64 cgroup_id;
+	// The cgroup whose path execpath.c saved in cgroup_paths last.
+	__u64 named_cgroup;
 };
 
 struct {

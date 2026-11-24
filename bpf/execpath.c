@@ -34,6 +34,12 @@
 // seed_tasks is an iterator the loader runs once after attaching, to add the
 // processes that were already running.
 //
+// The socket hooks also save the path of the socket user's cgroup v2 in
+// cgroup_paths, keyed by cgroup ID, the first time they see that cgroup on a
+// socket, so that mihomo can name the cgroup sockowner.c publishes for a
+// connection without reading cgroupfs. IDs aren't reused, so an entry stays
+// right after the cgroup is removed.
+//
 // Unlike sockowner.c, these programs read kernel structures (relocated with
 // BTF) and call bpf_d_path, so loading them needs CAP_PERFMON in addition to
 // CAP_BPF, and the kernel needs CONFIG_BPF_LSM with "bpf" among its active
@@ -41,6 +47,7 @@
 
 #include <linux/types.h>
 #include <linux/bpf.h>
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
@@ -75,11 +82,31 @@ struct vm_area_struct {
 	struct mm_struct *vm_mm;
 } __attribute__((preserve_access_index));
 
+// Before Linux 6.15 the parent pointer was called parent.
+struct kernfs_node {
+	struct kernfs_node *__parent;
+	const char *name;
+	__u64 id;
+} __attribute__((preserve_access_index));
+
+struct kernfs_node___old {
+	struct kernfs_node *parent;
+} __attribute__((preserve_access_index));
+
+struct cgroup {
+	struct kernfs_node *kn;
+} __attribute__((preserve_access_index));
+
+struct css_set {
+	struct cgroup *dfl_cgrp;
+} __attribute__((preserve_access_index));
+
 struct task_struct {
 	int pid;
 	int tgid;
 	__u64 start_boottime;
 	struct task_struct *group_leader;
+	struct css_set *cgroups;
 } __attribute__((preserve_access_index));
 
 // Iterating a task's VMAs holds a reference to its mm, which also keeps the
@@ -134,6 +161,46 @@ struct {
 	__type(key, __u32);
 	__type(value, struct exec_path);
 } exec_recent SEC(".maps");
+
+// Paths of cgroups relative to the cgroup v2 root, such as
+// /user.slice/user-1000.slice/session-2.scope, or / for the root itself.
+#define CGROUP_PATH_SIZE 1024
+// Components further from the root than this are not followed; such a path is
+// recorded with len set to -ENAMETOOLONG, as is one longer than the buffer.
+#define CGROUP_DEPTH_MAX 32
+// kernfs names are at most NAME_MAX bytes.
+#define CGROUP_NAME_SIZE 256
+#define ENAMETOOLONG 36
+
+struct cgroup_path {
+	__s32 len; // bytes in path including the NUL, or a negative errno
+	__u32 pad;
+	char path[CGROUP_PATH_SIZE];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u64);
+	__type(value, struct cgroup_path);
+} cgroup_paths SEC(".maps");
+
+// A cgroup_path with room for one more name past its end, so a name can be
+// copied before its length is known, and the cgroups on the way to the root.
+struct cgroup_scratch {
+	struct cgroup_path p;
+	char overflow[CGROUP_NAME_SIZE];
+	__u64 chain[CGROUP_DEPTH_MAX];
+};
+
+// The socket hooks can be preempted by another task running the same hook on
+// the same CPU, so they build in storage of the current task.
+struct {
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct cgroup_scratch);
+} cgroup_scratch SEC(".maps");
 
 // Space to build a record in, as it's too large for the stack. The exec hook
 // can sleep and be preempted, so it uses storage of the executing task rather
@@ -291,9 +358,94 @@ int BPF_PROG(record_free, struct task_struct *task)
 	return 0;
 }
 
+static __always_inline struct kernfs_node *kn_parent(struct kernfs_node *kn)
+{
+	if (bpf_core_field_exists(kn->__parent))
+		return BPF_CORE_READ(kn, __parent);
+	return BPF_CORE_READ((struct kernfs_node___old *)kn, parent);
+}
+
+// Saves the path of the current task's cgroup v2 in cgroup_paths unless it's
+// there, and returns its ID, or 0 if it couldn't be read. Names are read from
+// the leaf up and then written from the root down.
+static __always_inline __u64 save_cgroup_path(struct task_struct *task)
+{
+	struct kernfs_node *kn = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn);
+	struct cgroup_scratch *s;
+	__u64 id;
+	__u32 off = 0;
+	int depth = 0;
+
+	if (!kn)
+		return 0;
+	id = BPF_CORE_READ(kn, id);
+	if (!id || bpf_map_lookup_elem(&cgroup_paths, &id))
+		return id;
+	s = bpf_task_storage_get(&cgroup_scratch, task, 0,
+				 BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!s)
+		return 0;
+	s->p.len = 0;
+	s->p.pad = 0;
+	for (int i = 0; i <= CGROUP_DEPTH_MAX; i++) {
+		struct kernfs_node *parent = kn_parent(kn);
+
+		if (!parent) // kn is the root, whose name isn't part of a path
+			break;
+		if (depth == CGROUP_DEPTH_MAX) {
+			s->p.len = -ENAMETOOLONG;
+			break;
+		}
+		s->chain[depth & (CGROUP_DEPTH_MAX - 1)] = (__u64)kn;
+		depth++;
+		kn = parent;
+	}
+	if (!s->p.len && !depth) {
+		s->p.path[0] = '/';
+		s->p.path[1] = 0;
+		s->p.len = 2;
+	}
+	for (int i = CGROUP_DEPTH_MAX - 1; i >= 0 && !s->p.len; i--) {
+		const char *name;
+		long n;
+
+		if (i >= depth)
+			continue;
+		if (off >= CGROUP_PATH_SIZE) {
+			s->p.len = -ENAMETOOLONG;
+			break;
+		}
+		kn = (struct kernfs_node *)s->chain[i & (CGROUP_DEPTH_MAX - 1)];
+		name = BPF_CORE_READ(kn, name);
+		s->p.path[off] = '/';
+		off++;
+		if (off >= CGROUP_PATH_SIZE) {
+			s->p.len = -ENAMETOOLONG;
+			break;
+		}
+		// Room for CGROUP_NAME_SIZE bytes is left past off.
+		n = bpf_probe_read_kernel_str(&s->p.path[off], CGROUP_NAME_SIZE, name);
+		if (n <= 0) {
+			s->p.len = n ? n : -ENAMETOOLONG;
+			break;
+		}
+		off += n - 1; // the next component overwrites the NUL
+		if (!i) {
+			if (off >= CGROUP_PATH_SIZE)
+				s->p.len = -ENAMETOOLONG;
+			else
+				s->p.len = off + 1;
+		}
+	}
+	bpf_map_update_elem(&cgroup_paths, &id, &s->p, BPF_NOEXIST);
+	bpf_task_storage_delete(&cgroup_scratch, task);
+	return id;
+}
+
 // Records the current process as the owner of a TCP or UDP socket it uses,
-// and saves its record in exec_recent the first time it does.
-static __always_inline void record_socket_user(struct socket *sock)
+// and saves its record in exec_recent the first time it does. Saves the path
+// of its cgroup on a connect, and on a send when the socket's cgroup changed.
+static __always_inline void record_socket_user(struct socket *sock, int connect)
 {
 	struct sock *sk = sock->sk;
 	struct sock_owner *so;
@@ -310,6 +462,13 @@ static __always_inline void record_socket_user(struct socket *sock)
 	if (!so)
 		return;
 	record_current(so);
+	if (connect || so->named_cgroup != so->cgroup_id) {
+		__u64 id = save_cgroup_path(bpf_get_current_task_btf());
+
+		// The task can move between reading its cgroup ID and its
+		// path; only a path saved for the recorded ID counts.
+		so->named_cgroup = id == so->cgroup_id ? id : 0;
+	}
 	tgid = so->owner.tgid;
 	if (so->saved_tgid == tgid)
 		return;
@@ -328,7 +487,7 @@ int BPF_PROG(record_send, struct socket *sock, struct msghdr *msg, int size,
 {
 	if (ret)
 		return ret;
-	record_socket_user(sock);
+	record_socket_user(sock, 0);
 	return 0;
 }
 
@@ -339,7 +498,7 @@ int BPF_PROG(record_connect, struct socket *sock, struct sockaddr *address,
 {
 	if (ret)
 		return ret;
-	record_socket_user(sock);
+	record_socket_user(sock, 1);
 	return 0;
 }
 

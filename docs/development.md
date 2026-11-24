@@ -11,7 +11,9 @@ On Linux, mihomo can look up the process behind a connection in BPF maps instead
   ports can differ when redirection remaps a port to avoid a collision at its listener.
   The same hooks record the process's cgroup v2 ID (`bpf_get_current_cgroup_id`), which the
   egress hook publishes in `conn_cgroups` under the same key, together with the owner it
-  belongs to; key 1 of `abi_version` advertises that map.
+  belongs to; key 1 of `abi_version` advertises that map. With `-exec-paths` the LSM socket
+  hooks also save the path of each new cgroup in `cgroup_paths`, read from the kernfs nodes
+  of the task's default cgroup, so readers needn't see cgroupfs.
   The cgroup hooks don't see sends on a connected socket, so with
   `-exec-paths` LSM programs in `execpath.c` record those. Without it, a connected socket
   that a process hands to another stays with the process that connected it.
@@ -90,7 +92,8 @@ fragments and supports chains of up to eight IPv6 extension headers.
 and the owner it belongs to, that a move to another cgroup is seen on the next send
 (on a connected socket only through the `-exec-paths` hooks, which attach to the whole
 system), and that an accepted socket replaces a stale cgroup record with an empty one.
-`TestABIFeatures` checks the feature bit.
+`TestABIFeatures` checks the feature bits. The `-exec-paths` test also checks the
+recorded cgroup paths, including one deeper than the 32-level limit.
 
 In a separate mihomo checkout, `component/process/sockowner_vm_test.go` compares
 the BPF lookup with the `/proc` lookup. It needs the programs attached (with

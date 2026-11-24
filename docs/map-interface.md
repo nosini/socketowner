@@ -19,10 +19,12 @@ mode 0440. Owning a pin would let a reader grant itself write access.
 | `conn_cgroups` | `BPF_MAP_TYPE_LRU_HASH` (9) | 32 | 24 | With feature bit 0 |
 | `exec_tasks` | `BPF_MAP_TYPE_TASK_STORAGE` (29) | 4 | 1048 | With `-exec-paths` |
 | `exec_recent` | `BPF_MAP_TYPE_LRU_HASH` (9) | 4 | 1048 | With `-exec-paths` |
+| `cgroup_paths` | `BPF_MAP_TYPE_LRU_HASH` (9) | 8 | 1032 | With feature bit 1 (`-exec-paths`) |
 
 The `abi_version` entry at native-endian uint32 key 0 is native-endian uint32
 value 1. Key 1, when present, holds a native-endian uint32 bitmask of optional
-features: bit 0 means `conn_cgroups` is published. Loaders that predate the
+features: bit 0 means `conn_cgroups` is published, bit 1 that `cgroup_paths` is
+(only with `-exec-paths`). Loaders that predate the
 feature mask have only key 0, and a lookup of key 1 fails; treat that as no
 features. Readers must ignore feature bits they don't know. The loader freezes
 this map before pinning it. Readers must reject a
@@ -134,10 +136,35 @@ including a missing cgroup record or a TGID of 0, means the cgroup is unknown;
 it is never the cgroup of a different owner.
 
 A cgroup v2 ID is the inode number of the cgroup's directory in cgroupfs on
-64-bit kernels; IDs are not reused while the system runs. The ID only names the
-cgroup; resolving it to a path is up to the reader, and a cgroup removed before
-the lookup can no longer be resolved. A reader in a separate cgroup namespace,
-or one that doesn't see the host's cgroupfs, can't resolve IDs outside its view.
+64-bit kernels; IDs are not reused while the system runs. With feature bit 1,
+`cgroup_paths` names them. Otherwise a reader has to resolve IDs through
+cgroupfs itself: a cgroup removed before the lookup can't be resolved then,
+and a reader in a separate cgroup namespace, or one that doesn't see the host's
+cgroupfs, can't resolve IDs outside its view.
+
+`cgroup_paths` is keyed by the native-endian uint64 cgroup ID. Its value:
+
+| Byte offset | Type | Meaning |
+| ---: | --- | --- |
+| 0 | int32 | Path byte length including NUL (2 to 1024), or negative errno |
+| 4 | uint32 | Zero padding |
+| 8 | byte[1024] | Path bytes; meaningful only up to the length |
+
+The path is relative to the cgroup v2 root and starts with `/`, such as
+`/user.slice/user-1000.slice/session-2.scope`; the root cgroup is `/`. Names
+appear as in cgroupfs, including systemd's `\x2d`-style escapes. A path longer
+than 1024 bytes or more than 32 levels deep is recorded with length
+`-ENAMETOOLONG` (-36); ignore the path bytes then. As with executable paths, use
+the length and never scan for the NUL.
+
+The LSM socket hooks save the path of the socket user's cgroup on every connect,
+and on a send when the socket's recorded cgroup has changed since the path was
+last saved, unless the ID is already in the map. An entry is never rewritten, so
+it describes the cgroup when it was first seen; a cgroup renamed later keeps its
+old path. Entries outlive the cgroup and are evicted by LRU. A cgroup whose
+sockets have only sent since the loader attached, without connecting, may have
+lost its entry to eviction until the socket's cgroup changes; treat a missing
+entry as unknown.
 
 cgroups are attribution, not authentication. A process can create cgroups in
 any subtree delegated to it, such as its systemd user manager's, give them any

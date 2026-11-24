@@ -108,8 +108,8 @@ func TestABIFeatures(t *testing.T) {
 	if err := version.Lookup(uint32(0), &v); err != nil || v != abiVersion {
 		t.Fatalf("version %d, %v", v, err)
 	}
-	if err := version.Lookup(uint32(1), &features); err != nil || features&abiFeatureConnCgroups == 0 {
-		t.Fatalf("features %#x, %v", features, err)
+	if err := version.Lookup(uint32(1), &features); err != nil || features != abiFeatureConnCgroups {
+		t.Fatalf("features %#x, %v; want only conn_cgroups without -exec-paths", features, err)
 	}
 	if err := version.Update(uint32(1), uint32(0), ebpf.UpdateAny); err == nil {
 		t.Fatal("version map is writable")
@@ -169,7 +169,13 @@ func TestCgroupConnectedSendWithExecPaths(t *testing.T) {
 	owners := loadPinned(t, pin, mapName)
 	cgroups := loadPinned(t, pin, cgroupMapName)
 
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9})
+	// A listener keeps ICMP errors from failing later writes.
+	sink, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+	conn, err := net.DialUDP("udp4", nil, sink.LocalAddr().(*net.UDPAddr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +190,55 @@ func TestCgroupConnectedSendWithExecPaths(t *testing.T) {
 	if owner.TGID != want.TGID || cg != want {
 		t.Fatalf("owner %+v, cgroup record %+v, want %+v", owner, cg, want)
 	}
+
+	// The cgroup is named by its path below the cgroupfs root, and stays
+	// named after it's removed.
+	var features uint32
+	if err := loadPinned(t, pin, abiVersionMap).Lookup(uint32(1), &features); err != nil ||
+		features != abiFeatureConnCgroups|abiFeatureCgroupPaths {
+		t.Fatalf("features %#x, %v", features, err)
+	}
+	paths := loadPinned(t, pin, cgroupPathsMap)
+	rel, err := filepath.Rel("/sys/fs/cgroup", inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkPath := func(id uint64, want string) {
+		t.Helper()
+		var v cgroupPathValue
+		if err := paths.Lookup(id, &v); err != nil {
+			t.Fatalf("cgroup %d not named: %v", id, err)
+		}
+		if v.Len != int32(len(want)+1) || string(v.Path[:len(want)]) != want || v.Path[len(want)] != 0 {
+			t.Fatalf("cgroup %d: len %d, path %q, want %q", id, v.Len, v.Path[:max(0, min(int(v.Len), len(v.Path)))], want)
+		}
+	}
+	checkPath(cg.CgroupID, "/"+rel)
+
+	// A cgroup deeper than the limit is recorded as too long.
+	deep := inner
+	for i := 0; i < 33; i++ {
+		deep = childCgroup(t, deep, "d")
+	}
+	moveSelf(t, deep)
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	var v cgroupPathValue
+	if err := paths.Lookup(cgroupInode(t, deep), &v); err != nil || v.Len != -int32(unix.ENAMETOOLONG) {
+		t.Fatalf("deep cgroup: len %d, %v", v.Len, err)
+	}
+	moveSelf(t, cgroup)
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	checkPath(cgroupInode(t, cgroup), "/"+filepath.Base(cgroup))
+}
+
+type cgroupPathValue struct {
+	Len  int32
+	Pad  uint32
+	Path [1024]byte
 }
 
 // An accepted socket has no owner and must replace a stale cgroup record with

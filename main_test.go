@@ -95,10 +95,16 @@ func TestExecObjects(t *testing.T) {
 			if err := validateMapABI(spec, true); err != nil {
 				t.Fatal(err)
 			}
-			for _, name := range execMapNames {
+			for _, name := range []string{"exec_tasks", "exec_recent"} {
 				checkStructABI(t, spec.Maps[name].Value, 1048, []abiMember{
 					{"start_ns", 0, 8}, {"exit_ns", 8, 8}, {"len", 16, 4}, {"pad", 20, 4}, {"path", 24, 1024},
 				})
+			}
+			checkStructABI(t, spec.Maps[cgroupPathsMap].Value, 1032, []abiMember{
+				{"len", 0, 4}, {"pad", 4, 4}, {"path", 8, 1024},
+			})
+			if n, err := btf.Sizeof(spec.Maps[cgroupPathsMap].Key); err != nil || n != 8 {
+				t.Errorf("%s key: %d bytes, %v", cgroupPathsMap, n, err)
 			}
 			want := map[string]struct {
 				typ    ebpf.ProgramType

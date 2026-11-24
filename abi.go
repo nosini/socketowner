@@ -20,9 +20,18 @@ const (
 const (
 	// conn_cgroups holds the owner's cgroup for each conn_owners key.
 	abiFeatureConnCgroups uint32 = 1 << 0
-
-	abiFeatures = abiFeatureConnCgroups
+	// cgroup_paths names those cgroups; recorded with -exec-paths.
+	abiFeatureCgroupPaths uint32 = 1 << 1
 )
+
+// abiFeatures returns the features a loader with or without -exec-paths
+// publishes.
+func abiFeatures(execPaths bool) uint32 {
+	if execPaths {
+		return abiFeatureConnCgroups | abiFeatureCgroupPaths
+	}
+	return abiFeatureConnCgroups
+}
 
 // validateMapABI checks the public maps before loading an embedded object.
 // The loader must only advertise the ABI its objects actually implement.
@@ -37,8 +46,9 @@ func validateMapABI(spec *ebpf.CollectionSpec, execPaths bool) error {
 	}
 	if execPaths {
 		want = map[string]mapLayout{
-			"exec_tasks":  {ebpf.TaskStorage, 4, 1048},
-			"exec_recent": {ebpf.LRUHash, 4, 1048},
+			"exec_tasks":   {ebpf.TaskStorage, 4, 1048},
+			"exec_recent":  {ebpf.LRUHash, 4, 1048},
+			cgroupPathsMap: {ebpf.LRUHash, 8, 1032},
 		}
 	}
 	for name, w := range want {
@@ -53,7 +63,7 @@ func validateMapABI(spec *ebpf.CollectionSpec, execPaths bool) error {
 // pinABIVersion publishes a frozen marker before conn_owners becomes visible:
 // the version at key 0 and the optional features at key 1. Freeze prevents
 // userspace from changing the advertised ABI after attach.
-func pinABIVersion(path string, gid int) error {
+func pinABIVersion(path string, features uint32, gid int) error {
 	m, err := ebpf.NewMap(&ebpf.MapSpec{
 		Name:       abiVersionMap,
 		Type:       ebpf.Array,
@@ -62,7 +72,7 @@ func pinABIVersion(path string, gid int) error {
 		MaxEntries: 2,
 		Contents: []ebpf.MapKV{
 			{Key: uint32(0), Value: abiVersion},
-			{Key: uint32(1), Value: abiFeatures},
+			{Key: uint32(1), Value: features},
 		},
 	})
 	if err != nil {
