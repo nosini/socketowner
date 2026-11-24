@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,17 +21,32 @@ type pastaTarget struct {
 	Pad    uint32
 }
 
+// forwardKey names a pasta's DNS forward address as the sandbox sends to it.
+type forwardKey struct {
+	NetNS   uint64
+	Address [16]byte
+}
+
+// dnsForward is the host resolver pasta connects instead of that address.
+type dnsForward struct {
+	Resolver [16]byte
+}
+
 // relays finds the pasta of each sandbox whose wineserver appeared. Nothing is
 // read from pasta's memory, so no build matters: registration only says that
-// sockets it connects stand in for flows from that network namespace.
+// sockets it connects stand in for flows from that network namespace, and its
+// command line says where it sends DNS.
 type relays struct {
 	waiting map[int]*waitingServer
-	// find, register, registered, open, alive and closeFd are the process
-	// lookups, the pasta_targets update and lookup and their pidfd handling,
+	// forwards holds the dns_forwards map. find, register, registered,
+	// dns, open, alive and closeFd are the process lookups, the
+	// pasta_targets and dns_forwards updates and their pidfd handling,
 	// but for tests.
+	forwards   *ebpf.Map
 	find       func(server int) (pid, pidfd int, err error)
-	register   func(pidfd int, netns uint64) error
+	register   func(pid, pidfd int, netns uint64) error
 	registered func(pidfd int, netns uint64) bool
+	dns        func(pid int) (map[[16]byte][16]byte, error)
 	open       func(pid int) (int, error)
 	alive      func(pidfd int) bool
 	closeFd    func(pidfd int)
@@ -62,16 +78,18 @@ const (
 // usually stopping; otherwise another pasta is looked for later.
 var errPastaGone = errors.New("pasta exited")
 
-func newRelays(targets *ebpf.Map) *relays {
+func newRelays(targets, forwards *ebpf.Map) *relays {
 	return &relays{
 		waiting:  map[int]*waitingServer{},
+		forwards: forwards,
 		find:     findPasta,
 		open:     func(pid int) (int, error) { return unix.PidfdOpen(pid, 0) },
 		alive:    alive,
 		closeFd:  func(pidfd int) { unix.Close(pidfd) },
 		logf:     log.Printf,
 		reported: map[string]bool{},
-		register: func(pidfd int, netns uint64) error {
+		dns:      pastaDNS,
+		register: func(pid, pidfd int, netns uint64) error {
 			err := targets.Update(int32(pidfd), pastaTarget{NetNS: netns, Active: 1}, ebpf.UpdateAny)
 			if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESRCH) {
 				return errPastaGone
@@ -251,7 +269,7 @@ func (r *relays) scan(now time.Time, consume func(Event) error) error {
 			w.delay = min(2*w.delay, registeredMaxDelay)
 			continue
 		}
-		err = r.register(pidfd, w.netns)
+		err = r.register(pid, pidfd, w.netns)
 		if err == nil {
 			oldFd, oldPid := w.pastaFd, w.pastaPid
 			w.pastaPid, w.pastaFd = pid, pidfd
@@ -260,6 +278,7 @@ func (r *relays) scan(now time.Time, consume func(Event) error) error {
 			}
 			w.delay = scanInterval
 			w.next = now.Add(w.delay)
+			r.registerDNS(pid, w.netns)
 			if err := consume(Event{Type: "pasta", ServerTGID: uint32(server), PastaTGID: uint32(pid), NetNS: w.netns}); err != nil {
 				return err
 			}
@@ -277,4 +296,130 @@ func (r *relays) scan(now time.Time, consume func(Event) error) error {
 		w.next = now.Add(w.delay)
 	}
 	return nil
+}
+
+// registerDNS publishes the DNS forwarding a registered pasta applies. It only
+// reports failures: the relay join still works without them, and DNS flows just
+// stay unknown.
+func (r *relays) registerDNS(pid int, netns uint64) {
+	if r.forwards == nil || r.dns == nil {
+		return
+	}
+	forward, err := r.dns(pid)
+	if err != nil {
+		r.report(fmt.Errorf("pasta %d: %w", pid, err))
+		return
+	}
+	for from, to := range forward {
+		key := forwardKey{NetNS: netns, Address: from}
+		if err := r.forwards.Update(key, dnsForward{Resolver: to}, ebpf.UpdateAny); err != nil {
+			r.report(fmt.Errorf("pasta %d: register DNS forward: %w", pid, err))
+			return
+		}
+	}
+}
+
+// pastaDNS reads the DNS address translation a pasta applies; see
+// dnsTranslation for what it learns. Only the command line is read: pasta
+// takes its default --dns-host from the resolv.conf of the environment it
+// was started in, but pivots to an empty root before the observer can
+// register it, so that file can no longer be reached.
+func pastaDNS(pid int) (map[[16]byte][16]byte, error) {
+	arguments, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Split(strings.TrimRight(string(arguments), "\x00"), "\x00")
+	return dnsTranslation(fields)
+}
+
+// dnsOptions holds the DNS-related address options of a pasta's command
+// line, indexed by family: 0 for IPv4 and IPv4-in-IPv6, 1 for IPv6.
+type dnsOptions struct {
+	forward [2]netip.Addr
+	host    [2]netip.Addr
+}
+
+// parseDNSOptions reads the DNS-related address options of a pasta's command
+// line, as pasta takes them: --dns-forward and --dns-host, each in joined or
+// separate form and at most once per family.
+func parseDNSOptions(fields []string) (dnsOptions, error) {
+	var options dnsOptions
+	for i := 0; i < len(fields); i++ {
+		if fields[i] == "--" {
+			// The command pasta runs follows; its arguments aren't pasta's.
+			break
+		}
+		name, value, joined := strings.Cut(fields[i], "=")
+		var target *[2]netip.Addr
+		switch name {
+		case "--dns-forward":
+			target = &options.forward
+		case "--dns-host":
+			target = &options.host
+		default:
+			continue
+		}
+		if !joined {
+			if i+1 >= len(fields) {
+				return options, fmt.Errorf("%s without an address", name)
+			}
+			i++
+			value = fields[i]
+		}
+		if value == "none" {
+			// pasta's own spelling for an address option it unsets.
+			continue
+		}
+		address, err := netip.ParseAddr(value)
+		if err != nil {
+			return options, fmt.Errorf("%s %s: %w", name, value, err)
+		}
+		if address.Is6() && !address.Is4In6() {
+			(*target)[1] = address
+		} else {
+			(*target)[0] = address.Unmap()
+		}
+	}
+	return options, nil
+}
+
+// dnsTranslation maps each address a pasta forwards DNS from onto the host
+// resolver it connects instead, from its command line alone. pasta maps UDP
+// and TCP to port 53 sent to each --dns-forward address onto the nameserver
+// given by --dns-host, or by default the first nameserver of the resolv.conf
+// it was started with. That default is not on the command line, and pasta
+// pivots to an empty root before the observer can register it, so the
+// resolv.conf can no longer be read: a family maps only when the command
+// line names both addresses, and without --dns-host for a --dns-forward
+// address the mapping is reported missing once for that pasta, and queries
+// to that address stay unknown. Without --dns-forward, pasta maps its
+// --map-host-loopback or default gateway address, whose host nameserver no
+// command line names, and such queries stay unknown too.
+func dnsTranslation(fields []string) (map[[16]byte][16]byte, error) {
+	options, err := parseDNSOptions(fields)
+	if err != nil {
+		return nil, err
+	}
+	return options.translation()
+}
+
+// translation maps each --dns-forward address with a --dns-host address onto
+// that host address, per family. A --dns-forward address without --dns-host
+// is an error: the observer would otherwise silently leave that family's
+// DNS unknown, and reporting it once names the pasta that needs a
+// --dns-host on its command line.
+func (o dnsOptions) translation() (map[[16]byte][16]byte, error) {
+	translation := make(map[[16]byte][16]byte)
+	for family := range 2 {
+		forward, host := o.forward[family], o.host[family]
+		if !forward.IsValid() {
+			continue
+		}
+		if !host.IsValid() {
+			return nil, fmt.Errorf("--dns-forward %s without --dns-host: pasta takes its default host nameserver from a resolv.conf the observer cannot read", forward)
+		}
+		translation[forward.As16()] = host.As16()
+	}
+	return translation, nil
 }

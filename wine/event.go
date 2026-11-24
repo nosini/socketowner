@@ -31,7 +31,15 @@ type rawEvent struct {
 	Kind, ActorTGID uint32
 	Flow            rawFlow
 	Owner           rawOwner
+	Creator, Pad    uint32
 }
+
+// Socket creators, as the diagnostic events report them. A pasta's
+// replacement socket has neither.
+const (
+	createdServer uint32 = 1
+	createdClient uint32 = 2
+)
 
 // Event is diagnostic output, not a stable reader contract; routing reads the
 // pinned wine_flows map instead. The creator name is
@@ -42,6 +50,7 @@ type Event struct {
 	Observer       string `json:"observer,omitempty"`
 	SocketID       uint64 `json:"socket_id,omitempty"`
 	Status         string `json:"status,omitempty"`
+	Creator        string `json:"creator,omitempty"`
 	ServerTGID     uint32 `json:"server_tgid,omitempty"`
 	ServerStartNS  uint64 `json:"server_start_ns,omitempty"`
 	ActorTGID      uint32 `json:"actor_tgid,omitempty"`
@@ -97,6 +106,20 @@ func decodeEvent(data []byte) (Event, error) {
 		6: "ambiguous-relay", 7: "no-inner-flow", 8: "not-wine"}[o.Status]
 	if e.Status == "" {
 		return e, errors.New("invalid Wine capture status")
+	}
+	switch r.Creator {
+	case 0:
+	case createdServer:
+		e.Creator = "wineserver"
+	case createdClient:
+		e.Creator = "client"
+	default:
+		return e, errors.New("invalid Wine socket creator")
+	}
+	// Every socket this observer labels has a creator; only other actors,
+	// such as the pasta sockets a relay event reports, may lack one.
+	if r.Kind == 3 && r.Creator == 0 {
+		return e, errors.New("Wine create event without a creator")
 	}
 	if o.Status == 1 {
 		switch o.Encoding {

@@ -23,13 +23,14 @@ func TestEmbeddedObjectLayout(t *testing.T) {
 		"relay_flows":   {ebpf.LRUHash, binary.Size(rawOwner{}) + 32},
 		"wine_flows":    {ebpf.LRUHash, binary.Size(rawOwner{})},
 		"pasta_targets": {ebpf.TaskStorage, binary.Size(pastaTarget{})},
+		"dns_forwards":  {ebpf.LRUHash, binary.Size(dnsForward{})},
 	} {
 		m := spec.Maps[name]
 		if m == nil || m.Type != want.typ || int(m.ValueSize) != want.size {
 			t.Fatalf("map %s: %+v, expected size %d", name, m, want.size)
 		}
 	}
-	if binary.Size(rawEvent{}) != 1144 || binary.Size(rawOwner{}) != 1088 {
+	if binary.Size(rawEvent{}) != 1152 || binary.Size(rawOwner{}) != 1088 {
 		t.Fatal("unexpected userspace structure layout")
 	}
 	if len(spec.Programs) != 6 {

@@ -41,7 +41,7 @@ func TestWindowsImage(t *testing.T) {
 
 func TestUnknownDoesNotLeakPartialIdentity(t *testing.T) {
 	for _, status := range []uint32{2, 3, 6, 7, 8} {
-		r := rawEvent{Kind: 3, ActorTGID: 44, Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: status, Protocol: 6, WindowsPID: 123, ClientTGID: 45, ClientStartNS: 90, ImageBytes: 5}}
+		r := rawEvent{Kind: 3, ActorTGID: 44, Creator: 1, Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: status, Protocol: 6, WindowsPID: 123, ClientTGID: 45, ClientStartNS: 90, ImageBytes: 5}}
 		copy(r.Owner.Image[:], utf16.Encode([]rune(`C:\partial.exe`)))
 		var b bytes.Buffer
 		if err := binary.Write(&b, binary.NativeEndian, r); err != nil {
@@ -106,7 +106,7 @@ func TestDecodeRelayUnknown(t *testing.T) {
 }
 
 func TestDecodeMappedName(t *testing.T) {
-	r := rawEvent{Kind: 3, ActorTGID: 44, Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: 1, Protocol: 17, Encoding: 1, ImageBytes: 9, ClientTGID: 45}}
+	r := rawEvent{Kind: 3, ActorTGID: 44, Creator: 1, Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: 1, Protocol: 17, Encoding: 1, ImageBytes: 9, ClientTGID: 45}}
 	for i, b := range []byte("alpha.exe") {
 		r.Owner.Image[i/2] |= uint16(b) << (8 * (i % 2))
 	}
@@ -146,5 +146,43 @@ func TestDecodeServer(t *testing.T) {
 	e, err := decodeEvent(data.Bytes())
 	if err != nil || e.Type != "server" || e.ServerTGID != 44 || e.NetNS != 9 {
 		t.Fatalf("unexpected event: %+v, %v", e, err)
+	}
+}
+
+// Every labelled socket names who created it; a pasta socket names nobody.
+func TestDecodeCreator(t *testing.T) {
+	for _, tc := range []struct {
+		kind, creator uint32
+		event         string
+	}{
+		{3, 1, "wineserver"},
+		{3, 2, "client"},
+		{1, 2, "client"},
+		{5, 0, ""},
+	} {
+		r := rawEvent{Kind: tc.kind, ActorTGID: 44, Creator: tc.creator,
+			Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: 8, Protocol: 6}}
+		var data bytes.Buffer
+		if err := binary.Write(&data, binary.NativeEndian, r); err != nil {
+			t.Fatal(err)
+		}
+		e, err := decodeEvent(data.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e.Creator != tc.event {
+			t.Fatalf("creator %q, want %q", e.Creator, tc.event)
+		}
+	}
+	for _, creator := range []uint32{0, 3} {
+		r := rawEvent{Kind: 3, ActorTGID: 44, Creator: creator,
+			Owner: rawOwner{SocketID: 1, ServerTGID: 44, ServerStartNS: 42, Status: 1, Protocol: 6}}
+		var data bytes.Buffer
+		if err := binary.Write(&data, binary.NativeEndian, r); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodeEvent(data.Bytes()); err == nil {
+			t.Fatalf("accepted a create event with creator %d", creator)
+		}
 	}
 }

@@ -3,9 +3,11 @@ package wine
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,7 +128,7 @@ func TestScanRetriesExitedPasta(t *testing.T) {
 		pidfd, err := fds.open(20)
 		return 20, pidfd, err
 	})
-	r.register = func(pidfd int, netns uint64) error {
+	r.register = func(pid, pidfd int, netns uint64) error {
 		if gone {
 			return errPastaGone
 		}
@@ -164,7 +166,7 @@ func TestScanFailsOnRegistrationError(t *testing.T) {
 		pidfd, err := fds.open(20)
 		return 20, pidfd, err
 	})
-	r.register = func(int, uint64) error { return failure }
+	r.register = func(_, _ int, _ uint64) error { return failure }
 	r.add(10, 7, time.Now())
 	if err := r.scan(time.Now(), nil); !errors.Is(err, failure) {
 		t.Fatalf("got %v", err)
@@ -198,7 +200,7 @@ func TestScanRegistersReplacementPasta(t *testing.T) {
 		pidfd, err := fds.open(found)
 		return found, pidfd, err
 	})
-	r.register = func(pidfd int, netns uint64) error {
+	r.register = func(pid, pidfd int, netns uint64) error {
 		registrations++
 		return nil
 	}
@@ -246,7 +248,7 @@ func TestScanReregistersExecedPasta(t *testing.T) {
 		pidfd, err := fds.open(20)
 		return 20, pidfd, err
 	})
-	r.register = func(pidfd int, netns uint64) error {
+	r.register = func(pid, pidfd int, netns uint64) error {
 		registrations++
 		active[pidfd] = true
 		return nil
@@ -286,7 +288,7 @@ func TestAddReplacesExitedWineserver(t *testing.T) {
 		pidfd, err := fds.open(20)
 		return 20, pidfd, err
 	})
-	r.register = func(int, uint64) error { return nil }
+	r.register = func(_, _ int, _ uint64) error { return nil }
 	start := time.Now()
 	r.add(10, 7, start)
 	if err := r.scan(start, func(Event) error { return nil }); err != nil {
@@ -328,7 +330,7 @@ func TestScanDropsExitedWineserverFd(t *testing.T) {
 		pidfd, err := fds.open(20)
 		return 20, pidfd, err
 	})
-	r.register = func(int, uint64) error { return nil }
+	r.register = func(_, _ int, _ uint64) error { return nil }
 	start := time.Now()
 	r.add(10, 7, start)
 	if err := r.scan(start, func(Event) error { return nil }); err != nil {
@@ -358,7 +360,7 @@ func TestCloseReleasesHeldFds(t *testing.T) {
 		pidfd, err := fds.open(20)
 		return 20, pidfd, err
 	})
-	r.register = func(int, uint64) error { return nil }
+	r.register = func(_, _ int, _ uint64) error { return nil }
 	start := time.Now()
 	r.add(10, 7, start)
 	r.add(11, 8, start)
@@ -417,5 +419,96 @@ func TestAliveSeesExit(t *testing.T) {
 	cmd.Wait()
 	if alive(pidfd) {
 		t.Fatal("exited process reported alive")
+	}
+}
+
+func TestDNSTranslation(t *testing.T) {
+	forward := netip.MustParseAddr("169.254.1.1").As16()
+	host := netip.MustParseAddr("192.0.2.99").As16()
+	for _, tc := range []struct {
+		name    string
+		fields  []string
+		want    map[[16]byte][16]byte
+		failure string
+	}{
+		{
+			name:   "forward address with host nameserver",
+			fields: []string{"pasta.avx2", "--dns-forward", "169.254.1.1", "--dns-host", "192.0.2.99"},
+			want:   map[[16]byte][16]byte{forward: host},
+		},
+		{
+			name:   "joined form",
+			fields: []string{"pasta", "--dns-forward=169.254.1.1", "--dns-host=192.0.2.99"},
+			want:   map[[16]byte][16]byte{forward: host},
+		},
+		{
+			name:   "each family maps its own addresses",
+			fields: []string{"pasta", "--dns-forward", "169.254.1.1", "--dns-forward", "fd00::1", "--dns-host", "192.0.2.99", "--dns-host", "fd00::53"},
+			want: map[[16]byte][16]byte{
+				netip.MustParseAddr("169.254.1.1").As16(): netip.MustParseAddr("192.0.2.99").As16(),
+				netip.MustParseAddr("fd00::1").As16():     netip.MustParseAddr("fd00::53").As16(),
+			},
+		},
+		{
+			name:   "none unsets an address option",
+			fields: []string{"pasta", "--dns-forward", "none", "--dns-forward", "169.254.1.1", "--dns-host", "none", "--dns-host", "192.0.2.99"},
+			want:   map[[16]byte][16]byte{forward: host},
+		},
+		{
+			name:   "arguments of the command after -- are not pasta's",
+			fields: []string{"pasta", "--dns-forward", "169.254.1.1", "--dns-host", "192.0.2.99", "--", "game", "--dns-host", "fd00::53"},
+			want:   map[[16]byte][16]byte{forward: host},
+		},
+		{
+			name:   "map-host-loopback is not a mapping",
+			fields: []string{"pasta", "--map-host-loopback", "169.254.2.2", "--dns-forward", "169.254.1.1", "--dns-host", "192.0.2.99"},
+			want:   map[[16]byte][16]byte{forward: host},
+		},
+		{
+			name:   "host nameserver without a forward address maps nothing",
+			fields: []string{"pasta", "--dns-host", "192.0.2.99"},
+			want:   map[[16]byte][16]byte{},
+		},
+		{
+			name:   "no DNS options at all",
+			fields: []string{"pasta", "--map-guest-addr", "none"},
+			want:   map[[16]byte][16]byte{},
+		},
+		{
+			name:    "forward without a host nameserver",
+			fields:  []string{"pasta", "--dns-forward", "169.254.1.1"},
+			failure: "--dns-forward 169.254.1.1 without --dns-host",
+		},
+		{
+			name:    "one family's forward without its host nameserver",
+			fields:  []string{"pasta", "--dns-forward", "169.254.1.1", "--dns-host", "192.0.2.99", "--dns-forward", "fd00::1"},
+			failure: "--dns-forward fd00::1 without --dns-host",
+		},
+		{
+			name:    "forward without an address",
+			fields:  []string{"pasta", "--dns-forward"},
+			failure: "--dns-forward without an address",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := dnsTranslation(tc.fields)
+			if tc.failure != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.failure) {
+					t.Fatalf("got %v, want %q", err, tc.failure)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("translation %v, want %v", got, tc.want)
+			}
+			for from, to := range tc.want {
+				if got[from] != to {
+					t.Fatalf("translation %v, want %v", got, tc.want)
+				}
+			}
+		})
 	}
 }

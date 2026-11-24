@@ -1,7 +1,8 @@
 # Observe Windows socket creators from the host
 
 This optional command names the Windows program behind each outgoing TCP/UDP
-socket of every wineserver on the machine, for as long as it runs. It prints JSON
+socket created by wineserver or by a Wine client's own Linux process, for as
+long as it runs. It prints JSON
 diagnostics, and with `-pin` publishes the identities for mihomo's `WINE-PROCESS-NAME`
 and `WINE-PROCESS-PATH` rules, through each sandbox's pasta.
 
@@ -74,6 +75,10 @@ actual sending Linux TGID is a separate field. This is deliberately distinct fro
 native socketowner's latest-Linux-user semantics. Connect/send diagnostics describe
 attempted operations, not successful completion.
 
+A socket's events carry a `creator`: `wineserver` for a socket wineserver made
+for the program, `client` for one the program's own Linux process made. A relay
+event describes a pasta socket, which has no creator.
+
 A client whose name could not be read has status `no-image`, and a socket with no
 known client `no-client`. Neither carries a partial name. Images are limited to
 1024 bytes; no truncated image becomes a matchable name.
@@ -85,13 +90,15 @@ pasta unregistered. Routing records do not pass through this buffer.
 ## How capture works
 
 wineserver creates and connects Windows programs' sockets, so kernel hooks see
-only wineserver. Which program asked is recoverable from Wine's request protocol:
+wineserver for those. Which program asked is recoverable from Wine's request
+protocol:
 
 1. Each client thread has a request pipe. wineserver's read from a FIFO marks it,
    and the next write by another process names that pipe's client
    (`lsm/file_permission`). A pipe read for the first time names nobody until
    its client writes, so a socket created before then is `no-client`, not the
-   client of an earlier request.
+   client of an earlier request. The pipe's record also names the wineserver
+   that read it.
 2. Each later read records the client being served. wineserver is single-threaded
    and handles a request within the read which fetched it, so the sockets which
    follow are that client's (`lsm/socket_post_create`).
@@ -106,6 +113,18 @@ only wineserver. Which program asked is recoverable from Wine's request protocol
    client: the first mapping by address whose Linux file name ends in `.exe`.
    That gives a file name but not the path, and no Windows PID. The first such
    mapping need not be the program's image, so the name can be wrong.
+
+A Windows program also opens sockets in its own Linux process: the glibc
+resolver behind `getaddrinfo`, GStreamer, libldap. The same
+`lsm/socket_post_create` finds their creator by process ID in the client
+records, with the process's start time ruling out a reused ID, and labels them
+with that client's identity: status, image, encoding, Windows PID, client TGID
+and start time, and, in the fields which name a wineserver, the one that reads
+the client's requests. A client whose wineserver is not known, possible only
+when its pipe's record was evicted before its write, keeps its sockets
+unlabelled rather than name itself as its own server. Every socket creation by
+a process which is neither a wineserver nor a Wine client costs one map lookup
+by process ID, and nothing else.
 
 Client records carry the process's start time and are dropped on exec, so a reused
 PID can't inherit a name. A failed read is retried on the client's next request.
@@ -158,6 +177,10 @@ connection key. All integers are native endian. The value is:
 
 Encoding 0 is an absolute Windows path in UTF-16. Encoding 1 is one file name in
 bytes, with no directory. Readers must reject other values.
+
+The wineserver fields always name the client's wineserver, including for a
+socket the client's own process created. The UID is the capturing process's,
+so for such a socket it is the client's own.
 
 An image is valid only under these rules. For encoding 0, `ImageBytes` is even
 and 2 to 1024; the UTF-16 text has no U+0000 and no unpaired surrogate; after `/`
@@ -237,6 +260,27 @@ an owner the result is the same whichever connect comes first. If not, all of
 them are ambiguous and stay unknown: waiting flows are never paired by arrival
 order. Records older than two seconds are ignored.
 
+pasta's `--dns-forward` translation rewrites one destination: a query sent to
+the forward address leaves through a socket connected to the host's resolver
+instead, so the inner record is keyed by that destination, which keeps the join
+exact, with the source port pasta preserves and the shared-key rules above
+unchanged. The observer learns the translation when it registers the pasta,
+from its command line, and a family maps only when that line names both its
+`--dns-forward` address and its `--dns-host` address: pasta's default
+`--dns-host` comes from the resolv.conf of the environment it was started in,
+but pasta isolates itself into an empty root before the observer can register
+it, so that file can no longer be read. A pasta with `--dns-forward` but no
+`--dns-host` gets no mapping; the observer reports the missing address once
+for that pasta, and DNS to its forward address stays `wine-unknown`, so a
+sandbox that wants its DNS joined starts pasta with `--dns-host`. Only
+UDP and TCP to port 53 are translated, matching what pasta maps on the tested
+versions; pasta also maps port 853 on some versions, and those flows stay
+`wine-unknown`. Without `--dns-forward`, pasta maps its `--map-host-loopback`
+or default gateway address, whose host nameserver no command line names, and
+DNS in such sandboxes stays unknown. DNS sent to
+an address pasta does not map keeps its own record and joins as any other
+flow.
+
 A wineserver's first request tells BPF its network namespace, and from then on
 flows there are recorded, before any of its programs can have sent one. The
 observer then looks for the sandbox's pasta: a process outside that namespace,
@@ -277,6 +321,7 @@ only the observer, mihomo and test firewall rules use sudo:
 python3 wine/testdata/real-wine.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --work /absolute/task/real-wine
 python3 wine/testdata/pasta-route.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/route
 python3 wine/testdata/sandbox-route.py --sandbox /path/to/run-in-sandbox --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/sandbox
+python3 wine/testdata/pasta-dns.py --observer /absolute/path/socketowner-wine-observer --work /absolute/task/dns
 ```
 
 `pasta-route.py --control` repeats its run without the relay, where no rule may see
@@ -284,6 +329,11 @@ a Windows name. `sandbox-route.py --bits 32` uses 32-bit probes. Add `--observer
 exercise the installed systemd observer (restarts it and leaves it running),
 including its SELinux domain and shared routing maps. Probes need Wine's
 `winegcc` or mingw.
+
+The wine package's own privileged tests need no Wine at all: a helper process
+named `wineserver` reads a FIFO, a client helper writes it with a fake Windows
+identity at its GS base, and their sockets, a plain process's and a forked
+child's, are asserted against the events and `wine_flows`.
 
 ## Known limitations
 
@@ -294,17 +344,23 @@ including its SELinux domain and shared routing maps. Probes need Wine's
   [service validation](validation/service/README.md); Wine relay load remains untested.
 - **A multi-threaded wineserver** would break step 2 of capture. None exists among
   the tested runners; the design has no detection for one yet.
-- **Sockets the client opens itself.** Only sockets created by wineserver are
-  labelled. A Windows program can also open sockets in its own Linux process,
-  including the glibc resolver behind `getaddrinfo`, GStreamer and libldap. In the
-  host namespace they keep the native process name, so a `WINE-PROCESS-NAME` deny
-  does not cover them. In a sandbox they are recorded as `not-wine` and reported
-  as `wine-unknown`.
-- **DNS.** Name resolution runs in the client's Linux process, not wineserver, so
-  its socket is not labelled. A query to pasta's `--dns-forward` address is also
-  translated, so it matches no inner record; it is reported as `wine-unknown`
-  rather than `not-wine`, [as seen in NIKKE](validation/nikke/README.md). A rule
-  refusing `wine-unknown` must exempt any it reaches.
+- **Sockets the client opens itself.** These are labelled with the client's
+  identity, like wineserver's sockets for it, and reach mihomo the same two
+  ways. Still not covered: a client that hands lookups to another process, for
+  example over `systemd-resolved`'s or nscd's Unix socket, names that process,
+  which is not a Wine client; a forked child of a client which never wrote a
+  request of its own has its own process ID and stays unlabelled; a socket
+  created before the client's first request names nobody, because no client
+  record exists yet; and a client whose pipe record was evicted, a bounded-map
+  corner, keeps its own sockets unlabelled while wineserver's for it still work.
+- **DNS.** A query through pasta's `--dns-forward` address joins its client
+  only when pasta is started with `--dns-host`: the observer learns the
+  translation from the command line alone, and pasta's default host
+  nameserver comes from a resolv.conf that pasta's own isolation hides. DNS
+  stays `wine-unknown` where pasta's forward address is its default gateway,
+  which no command line names, where a pasta also maps port 853, because only
+  port 53 is translated, and where `--dns-forward` has no `--dns-host`. A rule
+  refusing `wine-unknown` must still exempt any it reaches.
 - **32-bit names.** A 32-bit client is named after the first mapped file whose
   Linux name ends in `.exe`, in address order. That need not be the program's
   image, and a Linux file name is not a Windows image name, so the name can be

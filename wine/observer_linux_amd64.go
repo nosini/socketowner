@@ -174,7 +174,7 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 	if err := consume(Event{Type: "ready"}); err != nil {
 		return err
 	}
-	pasta := newRelays(coll.Maps["pasta_targets"])
+	pasta := newRelays(coll.Maps["pasta_targets"], coll.Maps["dns_forwards"])
 	defer pasta.close()
 	var reportedLosses uint64
 	var scanned time.Time

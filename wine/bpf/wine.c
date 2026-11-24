@@ -11,6 +11,11 @@
 // profile. Creator records are immutable after socket_post_create returns: a
 // failed connect or a different sender must not rewrite a socket's creator.
 //
+// A Windows program also opens sockets in its own Linux process: the resolver
+// behind getaddrinfo, GStreamer, libldap. One lookup by TGID finds such a
+// process in the clients map, and its sockets get the same identity, naming
+// the wineserver that reads its requests rather than itself.
+//
 // A registered pasta carries a sandbox's traffic out through replacement
 // sockets. Its connect joins each one to the inner flow which caused it. The
 // inner packet is seen before it reaches pasta's TAP, so the record exists by
@@ -33,6 +38,9 @@
 #define SOCK_DGRAM 2
 #define MAY_WRITE 2
 #define MAY_READ 4
+// Who created a socket, as the diagnostic events report it.
+#define CREATED_SERVER 1
+#define CREATED_CLIENT 2
 // thread_info.status: a 32-bit syscall is active, so the task is compat.
 #define TS_COMPAT 0x0002
 // pasta handles a SYN as soon as it reads the TAP; older records are leftovers.
@@ -77,8 +85,10 @@ struct config {
 	__u32 sends, pad;
 };
 struct process_id {
-	__u64 start_ns;
-	__u32 tgid, pad;
+	// The client a request pipe names, and the wineserver that reads it:
+	// a client's own sockets report that server, never their own TGID.
+	__u64 start_ns, server_start_ns;
+	__u32 tgid, server_tgid;
 };
 struct server {
 	__u64 start_ns;
@@ -88,6 +98,10 @@ struct client {
 	__u64 start_ns, peb;
 	__u32 status, image_bytes, encoding, windows_pid;
 	__u16 image[IMAGE_BYTES / 2];
+	// The wineserver serving this client, recorded where the pipe pairing
+	// names the client itself.
+	__u64 server_start_ns;
+	__u32 server_tgid, pad;
 };
 struct owner {
 	__u64 socket_id, server_start_ns, client_start_ns, captured_boot_ns;
@@ -98,7 +112,9 @@ struct owner {
 struct storage {
 	struct owner owner;
 	__u32 ready, first_egress;
-	__u32 sends, pad;
+	// Creator of this socket: CREATED_SERVER or CREATED_CLIENT. A pasta
+	// socket has none, so relay events leave the field empty.
+	__u32 sends, creator;
 	// Used only in relay_flows, whose values are copies of this record.
 	__u64 seen_ns;
 	__u32 count, ambiguous;
@@ -106,6 +122,16 @@ struct storage {
 struct pasta_target {
 	__u64 netns;
 	__u32 active, pad;
+};
+// pasta's DNS forwarding sends queries to the host resolver instead of the
+// address the client wrote to. Learned from pasta's command line when it is
+// registered; see ../README.md.
+struct forward_key {
+	__u64 netns;
+	__u8 address[16];
+};
+struct dns_forward {
+	__u8 resolver[16];
 };
 struct conn_key {
 	__u64 netns;
@@ -132,6 +158,9 @@ struct event {
 	__u32 kind, actor_tgid;
 	struct flow flow;
 	struct owner owner;
+	// 0, CREATED_SERVER or CREATED_CLIENT. The pad keeps the size at a
+	// multiple of eight: the Go decoder counts no trailing padding.
+	__u32 creator, pad;
 };
 
 struct {
@@ -199,6 +228,14 @@ struct {
 	__type(key, struct relay_key);
 	__type(value, struct storage);
 } relay_flows SEC(".maps");
+// DNS translations of registered pastas, keyed by the forward address as the
+// sandbox sees it. Internal: wine_flows, the only pinned map, is unchanged.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 256);
+	__type(key, struct forward_key);
+	__type(value, struct dns_forward);
+} dns_forwards SEC(".maps");
 // An all-zero record: the update helper needs its value in map or stack memory,
 // and this one is too large for the stack.
 struct {
@@ -253,6 +290,7 @@ static __always_inline void emit(struct storage *s, __u32 kind, struct flow *f)
 	}
 	e->kind = kind;
 	e->actor_tgid = bpf_get_current_pid_tgid() >> 32;
+	e->creator = s->creator;
 	if (f)
 		e->flow = *f;
 	else
@@ -393,20 +431,35 @@ int BPF_PROG(wine_file, struct file *file, int mask, int ret)
 		pipe = bpf_map_lookup_elem(&request_pipes, &key);
 		if (pipe) {
 			bpf_map_update_elem(&serving, &tgid, pipe, BPF_ANY);
-		} else {
-			// This pipe's client hasn't written since the observer
-			// started, or its request_pipes entry was evicted. Don't
-			// attribute a socket in this request to the previous
-			// client: blank serving means no client.
-			bpf_map_update_elem(&request_pipes, &key, &id, BPF_NOEXIST);
-			bpf_map_update_elem(&serving, &tgid, &id, BPF_ANY);
+			// One wineserver reads a given pipe, but a takeover or a
+			// reused TGID must not leave a predecessor naming a
+			// client's sockets. The client identity keeps waiting for
+			// its next write, as before.
+			if (pipe->server_tgid != tgid ||
+			    pipe->server_start_ns != task->group_leader->start_boottime) {
+				struct process_id record = *pipe;
+				record.server_tgid = tgid;
+				record.server_start_ns = task->group_leader->start_boottime;
+				bpf_map_update_elem(&request_pipes, &key, &record, BPF_EXIST);
+			}
+			return 0;
 		}
+		// This pipe's client hasn't written since the observer started,
+		// or its request_pipes entry was evicted. Don't attribute a
+		// socket in this request to the previous client: blank serving
+		// means no client. The entry does name its wineserver.
+		id.server_tgid = tgid;
+		id.server_start_ns = task->group_leader->start_boottime;
+		bpf_map_update_elem(&request_pipes, &key, &id, BPF_NOEXIST);
+		bpf_map_update_elem(&serving, &tgid, &id, BPF_ANY);
 		return 0;
 	}
 	if (!(mask & MAY_WRITE) || !(pipe = bpf_map_lookup_elem(&request_pipes, &key)))
 		return 0;
 	id.tgid = tgid;
 	id.start_ns = task->group_leader->start_boottime;
+	id.server_tgid = pipe->server_tgid;
+	id.server_start_ns = pipe->server_start_ns;
 	bpf_map_update_elem(&request_pipes, &key, &id, BPF_EXIST);
 	c = bpf_map_lookup_elem(&clients, &tgid);
 	if (!c || c->start_ns != id.start_ns) {
@@ -419,9 +472,36 @@ int BPF_PROG(wine_file, struct file *file, int mask, int ret)
 			return 0;
 		c->start_ns = id.start_ns;
 	}
+	// The wineserver which reads this pipe serves this client, so the
+	// client's own sockets can name it. A write with no server named, which
+	// only an evicted pipe record can cause, leaves the record alone:
+	// wine_create refuses to label without a server rather than put the
+	// client's own TGID in the server fields.
+	if (id.server_tgid) {
+		c->server_tgid = id.server_tgid;
+		c->server_start_ns = id.server_start_ns;
+	}
 	if (c->status != KNOWN)
 		read_client(task, c);
 	return 0;
+}
+
+// Fills a fresh owner with a client's identity: the client's TGID and start
+// time, and its image once read. A client whose image could not be read keeps
+// no-image, exactly as a wineserver-created socket for it would.
+static __always_inline void label_from_client(struct owner *o, struct client *c, __u32 tgid)
+{
+	o->client_tgid = tgid;
+	o->client_start_ns = c->start_ns;
+	o->status = NO_IMAGE;
+	if (c->status != KNOWN)
+		return;
+	if (bpf_probe_read_kernel(o->image, IMAGE_BYTES, c->image))
+		return;
+	o->windows_pid = c->windows_pid;
+	o->image_bytes = c->image_bytes;
+	o->encoding = c->encoding;
+	o->status = KNOWN;
 }
 
 SEC("lsm/socket_post_create")
@@ -435,6 +515,7 @@ int BPF_PROG(wine_create, struct socket *socket, int family, int type, int proto
 	struct config *config;
 	__u32 key = 0, tgid;
 	__u64 *seq, id;
+	int server;
 	if (ret)
 		return ret;
 	if (kern || (family != 2 && family != 10) || (type != 1 && type != 2))
@@ -442,10 +523,27 @@ int BPF_PROG(wine_create, struct socket *socket, int family, int type, int proto
 	if (protocol && protocol != (type == 1 ? 6 : 17))
 		return 0;
 	sk = socket->sk;
-	if (!sk || !is_server())
+	if (!sk)
 		return 0;
+	server = is_server();
 	task = bpf_get_current_task_btf();
 	tgid = bpf_get_current_pid_tgid() >> 32;
+	if (!server) {
+		// A Windows program also opens sockets in its own Linux process:
+		// the resolver behind getaddrinfo, GStreamer, libldap. Reading the
+		// current task and one lookup by TGID are all this path costs
+		// every other process; the start time rules out a reused PID, and
+		// a forked child, which has its own TGID and never wrote a
+		// request, stays unlabelled.
+		c = bpf_map_lookup_elem(&clients, &tgid);
+		if (!c || c->start_ns != task->group_leader->start_boottime)
+			return 0;
+		// Only a client whose wineserver is known is labelled: always
+		// the one reading its pipe, unless that record was evicted
+		// before its write. The client's own TGID never names a server.
+		if (!c->server_tgid)
+			return 0;
+	}
 	s = bpf_sk_storage_get(&wine_sockets, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
 	if (!s || s->ready)
 		return 0;
@@ -455,25 +553,30 @@ int BPF_PROG(wine_create, struct socket *socket, int family, int type, int proto
 		return 0;
 	id = __sync_fetch_and_add(seq, 1) + 1;
 	s->owner.socket_id = id;
-	s->owner.server_start_ns = task->group_leader->start_boottime;
 	s->owner.captured_boot_ns = bpf_ktime_get_boot_ns();
-	s->owner.server_tgid = tgid;
 	s->owner.uid = bpf_get_current_uid_gid();
 	s->owner.protocol = type == 1 ? 6 : 17;
-	s->owner.status = NO_CLIENT;
-	request = bpf_map_lookup_elem(&serving, &tgid);
-	if (request && request->tgid) {
-		s->owner.client_tgid = request->tgid;
-		s->owner.client_start_ns = request->start_ns;
-		s->owner.status = NO_IMAGE;
-		c = bpf_map_lookup_elem(&clients, &request->tgid);
-	}
-	if (c && c->start_ns == request->start_ns && c->status == KNOWN &&
-	    !bpf_probe_read_kernel(s->owner.image, IMAGE_BYTES, c->image)) {
-		s->owner.windows_pid = c->windows_pid;
-		s->owner.image_bytes = c->image_bytes;
-		s->owner.encoding = c->encoding;
-		s->owner.status = KNOWN;
+	if (server) {
+		s->owner.server_start_ns = task->group_leader->start_boottime;
+		s->owner.server_tgid = tgid;
+		s->owner.status = NO_CLIENT;
+		request = bpf_map_lookup_elem(&serving, &tgid);
+		if (request && request->tgid) {
+			s->owner.client_tgid = request->tgid;
+			s->owner.client_start_ns = request->start_ns;
+			s->owner.status = NO_IMAGE;
+			c = bpf_map_lookup_elem(&clients, &request->tgid);
+			if (c && c->start_ns == request->start_ns)
+				label_from_client(&s->owner, c, request->tgid);
+		}
+		s->creator = CREATED_SERVER;
+	} else {
+		// The same identity a wineserver-created socket for this client
+		// gets, with the client's wineserver in the server fields.
+		s->owner.server_tgid = c->server_tgid;
+		s->owner.server_start_ns = c->server_start_ns;
+		label_from_client(&s->owner, c, tgid);
+		s->creator = CREATED_CLIENT;
 	}
 	s->sends = config->sends;
 	// No other process can use this newly created socket before this hook
@@ -691,6 +794,20 @@ static __always_inline void note_inner_flow(struct flow *f, struct storage *s)
 		return;
 	k.netns = f->netns;
 	__builtin_memcpy(k.destination, f->destination, 16);
+	// pasta's DNS forwarding sends a query to the host resolver instead of
+	// the address the client wrote to, and it keeps the source port, so the
+	// record keeps an exact key by using the destination pasta connects to.
+	// Port 53 only: a flow pasta does not map must keep its own destination,
+	// and pasta versions disagree about 853.
+	if (f->destination_port == 53) {
+		struct forward_key fk = {};
+		struct dns_forward *forward;
+		fk.netns = f->netns;
+		__builtin_memcpy(fk.address, f->destination, 16);
+		forward = bpf_map_lookup_elem(&dns_forwards, &fk);
+		if (forward)
+			__builtin_memcpy(k.destination, forward->resolver, 16);
+	}
 	k.destination_port = f->destination_port;
 	k.protocol = f->protocol;
 	if (f->protocol == 17) {
