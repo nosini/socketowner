@@ -14,10 +14,10 @@
 // owned them could make them writable and forge entries.
 package main
 
-//go:generate clang -O2 -g -Wall -target bpfel -c bpf/sockowner.c -o sockowner_bpfel.o
-//go:generate clang -O2 -g -Wall -target bpfeb -c bpf/sockowner.c -o sockowner_bpfeb.o
-//go:generate clang -O2 -g -Wall -target bpfel -c bpf/execpath.c -o execpath_bpfel.o
-//go:generate clang -O2 -g -Wall -target bpfeb -c bpf/execpath.c -o execpath_bpfeb.o
+//go:generate clang -O2 -g -Wall -target bpfel -fdebug-compilation-dir=. -c bpf/sockowner.c -o sockowner_bpfel.o
+//go:generate clang -O2 -g -Wall -target bpfeb -fdebug-compilation-dir=. -c bpf/sockowner.c -o sockowner_bpfeb.o
+//go:generate clang -O2 -g -Wall -target bpfel -fdebug-compilation-dir=. -c bpf/execpath.c -o execpath_bpfel.o
+//go:generate clang -O2 -g -Wall -target bpfeb -fdebug-compilation-dir=. -c bpf/execpath.c -o execpath_bpfeb.o
 //go:generate llvm-strip -g sockowner_bpfel.o sockowner_bpfeb.o execpath_bpfel.o execpath_bpfeb.o
 
 import (
