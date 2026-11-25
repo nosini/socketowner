@@ -9,6 +9,9 @@ On Linux, mihomo can look up the process behind a connection in BPF maps instead
   and user ID in the `conn_owners` LRU map, keyed by network namespace, protocol, source
   address and source port, both read from the packet after any NAT translation. Socket
   ports can differ when redirection remaps a port to avoid a collision at its listener.
+  Sockets with different peers can share a source address and port, so the hook also
+  publishes each flow in `conn_flows`, whose key adds the packet's destination address
+  and port, with the owner and its cgroup in one record (feature bit 2).
   The same hooks record the process's cgroup v2 ID (`bpf_get_current_cgroup_id`), which the
   egress hook publishes in `conn_cgroups` under the same key, together with the owner it
   belongs to; key 1 of `abi_version` advertises that map. With `-exec-paths` the LSM socket

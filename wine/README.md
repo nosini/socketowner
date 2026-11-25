@@ -156,12 +156,19 @@ them again. On exit it removes only pins that are still its own.
 
 | Pin | Linux map type | Key bytes | Value bytes | Meaning |
 | --- | --- | ---: | ---: | --- |
-| `wine_abi` | `ARRAY` (2) | 4 | 4 | Frozen; key 0 holds the version |
+| `wine_abi` | `ARRAY` (2) | 4 | 4 | Frozen; key 0 holds the version, key 1 the features |
 | `wine_heartbeat` | `ARRAY` (2) | 4 | 8 | Key 0 holds `CLOCK_BOOTTIME` nanoseconds, updated every second |
+| `wine_peer_flows` | `LRU_HASH` (9) | 48 | 1088 | Identity by outgoing packet source and destination; feature bit 0 |
 | `wine_flows` | `LRU_HASH` (9) | 32 | 1088 | Identity by outgoing packet source |
 
 `wine_flows` is pinned last and is the publication point. Its key is the v1
-connection key. All integers are native endian. The value is:
+connection key. Key 1 of `wine_abi` holds a bitmask of optional features; bit 0
+means `wine_peer_flows` is published. Observers that predate it have only key 0,
+and a reader treats a failed lookup of key 1 as no features. `wine_peer_flows`
+holds the same records keyed by socketowner's `conn_flows` key, which adds the
+packet's destination address and port, so sockets sharing a source address and
+port keep their own records. All integers are native endian. The value of both
+maps is:
 
 | Byte offset | Type | Meaning |
 | ---: | --- | --- |
@@ -206,12 +213,17 @@ Any other status is invalid.
 The kernel writes a record before the packet it describes leaves `wine_egress`,
 so it precedes mihomo's first lookup; it does not depend on the event buffer.
 An unlabelled userspace socket which sends from a recorded address and port
-removes the record; a packet from the kernel's TCP control socket, such as a
+removes the record from `wine_flows`, and from `wine_peer_flows` only the record
+of the flow it sends; a packet from the kernel's TCP control socket, such as a
 generated reset or acknowledgement, changes nothing. Active flows republish
 after LRU eviction. A reader must:
 
 1. Check the version, map types and sizes before any lookup, as for v1.
-2. Consult `wine_flows` first. No record means ordinary lookup proceeds.
+2. Consult `wine_peer_flows` first when the flow's destination is known, then
+   `wine_flows`. No record means ordinary lookup proceeds. A `wine_flows` record
+   can be another socket's on the same port: if the socket's owner is known and
+   is neither the record's wineserver nor its client, the record isn't the
+   flow's.
 3. Treat a record with another status, a heartbeat older than five seconds, or an
    image failing the validation above as **unknown**, not as absent. Falling
    through would name the relay, or whichever process now holds a reused port.
@@ -235,7 +247,9 @@ old-style WOW64, because it isn't known.
 
 ### Evolution
 
-Any change to the key or value layout, or to the meaning of a field, status value
+An optional map that keeps every guarantee of the current version is added with
+a feature bit at key 1 of `wine_abi` instead, as `wine_peer_flows` was. Any
+change to the key or value layout, or to the meaning of a field, status value
 or image encoding, requires a new `wine_abi` version; a reader must reject a
 version it does not know before interpreting `wine_flows`. Version 1 had the same
 sizes and offsets, but field 16 held the Windows process start time that
@@ -395,5 +409,7 @@ child's, are asserted against the events and `wine_flows`.
   connecting to the same destinations at the same time.
 - **Shared source ports.** Linux lets sockets with different peers share a local
   address and port. When an unlabelled socket sends from the address and port of
-  a live pasta socket, it removes that socket's record by design, and the flow
-  shows only as pasta, or as whichever process mihomo finds for that port.
+  a live pasta socket, it removes that socket's `wine_flows` record by design.
+  `wine_peer_flows` keeps the pasta flow's record, so a reader that knows the
+  destination still names it; one that reads only `wine_flows` shows the flow
+  only as pasta, or as whichever process it finds for that port.

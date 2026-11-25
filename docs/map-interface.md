@@ -17,6 +17,7 @@ mode 0440. Owning a pin would let a reader grant itself write access.
 | `abi_version` | `BPF_MAP_TYPE_ARRAY` (2) | 4 | 4 | Required; one entry |
 | `conn_owners` | `BPF_MAP_TYPE_LRU_HASH` (9) | 32 | 16 | Required |
 | `conn_cgroups` | `BPF_MAP_TYPE_LRU_HASH` (9) | 32 | 24 | With feature bit 0 |
+| `conn_flows` | `BPF_MAP_TYPE_LRU_HASH` (9) | 48 | 24 | With feature bit 2 |
 | `exec_tasks` | `BPF_MAP_TYPE_TASK_STORAGE` (29) | 4 | 1048 | With `-exec-paths` |
 | `exec_recent` | `BPF_MAP_TYPE_LRU_HASH` (9) | 4 | 1048 | With `-exec-paths` |
 | `cgroup_paths` | `BPF_MAP_TYPE_LRU_HASH` (9) | 8 | 1032 | With feature bit 1 (`-exec-paths`) |
@@ -24,7 +25,7 @@ mode 0440. Owning a pin would let a reader grant itself write access.
 The `abi_version` entry at native-endian uint32 key 0 is native-endian uint32
 value 1. Key 1, when present, holds a native-endian uint32 bitmask of optional
 features: bit 0 means `conn_cgroups` is published, bit 1 that `cgroup_paths` is
-(only with `-exec-paths`). Loaders that predate the
+(only with `-exec-paths`), and bit 2 that `conn_flows` is. Loaders that predate the
 feature mask have only key 0, and a lookup of key 1 fails; treat that as no
 features. Readers must ignore feature bits they don't know. The loader freezes
 this map before pinning it. Readers must reject a
@@ -34,7 +35,7 @@ performing any lookup; a larger kernel value would overflow a smaller userspace
 buffer. Open maps with `BPF_F_RDONLY` and close-on-exec descriptors.
 
 Attach replaces previous links and pins in the same directories. Optional maps,
-`conn_cgroups` and the version marker are pinned before `conn_owners`, which is
+`conn_cgroups`, `conn_flows` and the version marker are pinned before `conn_owners`, which is
 the publication point. Each pin appears under its documented name only with its final owner and
 mode, so a reader that opens one of these paths never finds it unreadable.
 Readers should reopen all maps when that pin's inode changes and retry
@@ -91,7 +92,9 @@ The owner is the process that creates, connects or sends on the socket. With
 `-exec-paths`, LSM hooks also see sends on connected sockets; without it, passing
 an already connected socket may leave the earlier owner recorded. The egress hook
 publishes the current owner against the outgoing packet's source address/port.
-The key does not distinguish remote destinations. Entries outlive closed sockets
+The key does not distinguish remote destinations: `connect()` lets sockets with
+different peers share a local address and port, and the entry then holds
+whichever of them sent last. [Flow records](#flow-records) tell them apart. Entries outlive closed sockets
 and are evicted by LRU; active flows republish after eviction. A TCP or UDP
 socket without a recorded owner, such as one from before attachment or an
 accepted socket, publishes an unknown owner (TGID 0), so a stale entry for the
@@ -109,6 +112,47 @@ Without the exec maps, a reader resolves the owner through `/proc`. The owner wa
 running when `boot_ns` was recorded, so a `/proc/<pid>/stat` start time later than
 `boot_ns` (field 22, in `USER_HZ` ticks since boot, allowing for tick resolution)
 names a different process; such a reader must not use that process's executable.
+
+## Flow records
+
+When feature bit 2 is set, `conn_flows` publishes the owner and its cgroup keyed
+by both ends of the outgoing packet. Its key is 48 bytes:
+
+| Byte offset | Type | Meaning |
+| ---: | --- | --- |
+| 0 | uint64 | Network namespace cookie (`SO_NETNS_COOKIE`) |
+| 8 | byte[16] | Source IP; IPv4 uses IPv4-mapped IPv6 |
+| 24 | byte[16] | Destination IP; IPv4 uses IPv4-mapped IPv6 |
+| 40 | uint16 | Source port, host byte order |
+| 42 | uint16 | Destination port, host byte order |
+| 44 | uint8 | IP protocol: 6 for TCP, 17 for UDP |
+| 45 | byte[3] | Zero padding |
+
+Its value is 24 bytes:
+
+| Byte offset | Type | Meaning |
+| ---: | --- | --- |
+| 0 | uint32 | Owner TGID; 0 means unknown |
+| 4 | uint32 | Owner UID, in the initial user namespace |
+| 8 | uint64 | `boot_ns`, as in `conn_owners` |
+| 16 | uint64 | cgroup v2 ID of the owner, or 0; as in `conn_cgroups`, 0 when the TGID is 0 |
+
+The egress hook writes it with `conn_owners` and `conn_cgroups`, under the same
+rules, so the owner fields equal what `conn_owners` holds for a socket that was
+the last to send from its address and port. Owner and cgroup are one record, so
+unlike `conn_cgroups` no match against `conn_owners` is needed.
+
+Addresses and ports are the packet's as it leaves the egress hook, after
+netfilter's output and postrouting translation. A flow redirected to a local
+listener (`redirect`, as TUN `auto-redirect` does) is keyed by that listener's
+address and port, not by its original destination; a reader that knows both
+should look up each. An unconnected UDP socket gets a record for every
+destination it sends to.
+
+Readers should prefer `conn_flows` when they know the flow's destination, and
+fall back to `conn_owners` when it has no record, as for flows sent before the
+loader attached or evicted since. A miss there doesn't mean the owner is
+unknown.
 
 ## Owner cgroups
 
@@ -235,7 +279,7 @@ rule and validation.
 
 Changes to names, layouts, byte order or record meaning require a new ABI version.
 An optional map that keeps every v1 guarantee is added with a new feature bit at
-key 1 of `abi_version` instead, as `conn_cgroups` was.
+key 1 of `abi_version` instead, as `conn_cgroups` and `conn_flows` were.
 A breaking version must also use a separate pin directory so a reader cannot mix
 old and new maps during replacement. Keep old ABI support explicitly if needed;
 never silently reinterpret v1 records. Extra private maps or optional features

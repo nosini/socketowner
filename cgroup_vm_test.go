@@ -97,7 +97,8 @@ func udpKey(t *testing.T, conn *net.UDPConn) ownerKey {
 	}
 }
 
-// The loader advertises conn_cgroups at key 1 of the frozen version map.
+// The loader advertises conn_cgroups and conn_flows at key 1 of the frozen
+// version map.
 func TestABIFeatures(t *testing.T) {
 	cgroup, pin := isolatedTestEnv(t)
 	if err := attach(cgroup, pin, false, -1); err != nil {
@@ -108,8 +109,8 @@ func TestABIFeatures(t *testing.T) {
 	if err := version.Lookup(uint32(0), &v); err != nil || v != abiVersion {
 		t.Fatalf("version %d, %v", v, err)
 	}
-	if err := version.Lookup(uint32(1), &features); err != nil || features != abiFeatureConnCgroups {
-		t.Fatalf("features %#x, %v; want only conn_cgroups without -exec-paths", features, err)
+	if err := version.Lookup(uint32(1), &features); err != nil || features != abiFeatureConnCgroups|abiFeatureConnFlows {
+		t.Fatalf("features %#x, %v; want conn_cgroups and conn_flows without -exec-paths", features, err)
 	}
 	if err := version.Update(uint32(1), uint32(0), ebpf.UpdateAny); err == nil {
 		t.Fatal("version map is writable")
@@ -195,7 +196,7 @@ func TestCgroupConnectedSendWithExecPaths(t *testing.T) {
 	// named after it's removed.
 	var features uint32
 	if err := loadPinned(t, pin, abiVersionMap).Lookup(uint32(1), &features); err != nil ||
-		features != abiFeatureConnCgroups|abiFeatureCgroupPaths {
+		features != abiFeatureConnCgroups|abiFeatureConnFlows|abiFeatureCgroupPaths {
 		t.Fatalf("features %#x, %v", features, err)
 	}
 	paths := loadPinned(t, pin, cgroupPathsMap)

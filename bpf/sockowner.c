@@ -9,7 +9,10 @@
 // connects or sends on a socket and remember it in socket-local storage. The
 // egress hook publishes the owner in conn_owners, keyed by network namespace,
 // protocol, source address and source port, as taken from each outgoing
-// packet. Entries outlive the socket and are evicted least-recently-used.
+// packet, and in conn_flows, whose key adds the destination address and port.
+// Sockets with different peers can share a source address and port, which
+// only conn_flows tells apart. Entries outlive the socket and are evicted
+// least-recently-used.
 //
 // Only UAPI context structures are used, so the object needs no BTF
 // relocations. The programs avoid helpers that need CAP_PERFMON (such as
@@ -53,6 +56,31 @@ struct {
 	__type(key, struct conn_key);
 	__type(value, struct conn_cgroup);
 } conn_cgroups SEC(".maps");
+
+// conn_flows adds the destination to conn_key, so that sockets sharing a local
+// address and port are told apart, and holds the owner and its cgroup in one
+// record, which no separate eviction can split.
+struct flow_key {
+	__u64 netns;
+	__u8 saddr[16]; // IPv4 is stored IPv4-mapped (::ffff:a.b.c.d)
+	__u8 daddr[16];
+	__u16 sport;    // host byte order
+	__u16 dport;    // host byte order
+	__u8 proto;
+	__u8 pad[3];
+};
+
+struct conn_flow {
+	struct conn_owner owner;
+	__u64 cgroup_id; // cgroup v2 ID of the owner, or 0
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct flow_key);
+	__type(value, struct conn_flow);
+} conn_flows SEC(".maps");
 
 SEC("cgroup/sock_create")
 int sock_create(struct bpf_sock *sk)
@@ -117,15 +145,16 @@ int sendmsg6(struct bpf_sock_addr *ctx)
 }
 
 // Netfilter may change the source port when redirecting flows that would
-// otherwise collide at the local listener. The socket keeps its original
-// port, but readers see the translated packet port. Parse it just as we do
-// the source address, including IP options and IPv6 extension headers.
-static __always_inline int packet_source_port(struct __sk_buff *skb,
-					     __u8 version, __u8 protocol,
-					     __u16 *port)
+// otherwise collide at the local listener, and a redirect changes the
+// destination. The socket keeps its original ports, but readers see the
+// translated packet's. Parse them just as we do the addresses, including IP
+// options and IPv6 extension headers.
+static __always_inline int packet_ports(struct __sk_buff *skb, __u8 version,
+					__u8 protocol, __u16 *sport,
+					__u16 *dport)
 {
 	__u32 offset;
-	__u16 fragment, wire_port;
+	__u16 fragment, wire_ports[2];
 	__u8 next;
 
 	if (version == 4) {
@@ -172,9 +201,11 @@ static __always_inline int packet_source_port(struct __sk_buff *skb,
 			next = header[0];
 		}
 	}
-	if (next != protocol || bpf_skb_load_bytes(skb, offset, &wire_port, 2))
+	if (next != protocol ||
+	    bpf_skb_load_bytes(skb, offset, wire_ports, sizeof(wire_ports)))
 		return -1;
-	*port = bpf_ntohs(wire_port);
+	*sport = bpf_ntohs(wire_ports[0]);
+	*dport = bpf_ntohs(wire_ports[1]);
 	return 0;
 }
 
@@ -192,6 +223,7 @@ int egress(struct __sk_buff *skb)
 	struct bpf_sock *sk = skb->sk;
 	struct sock_owner *so;
 	struct conn_key key = {};
+	struct flow_key fkey = {};
 	__u8 version;
 
 	if (!sk)
@@ -219,21 +251,27 @@ int egress(struct __sk_buff *skb)
 		return 1;
 	version >>= 4;
 	if (version == 4) {
-		key.addr[10] = 0xff;
-		key.addr[11] = 0xff;
-		if (bpf_skb_load_bytes(skb, 12, &key.addr[12], 4))
+		fkey.saddr[10] = fkey.saddr[11] = 0xff;
+		fkey.daddr[10] = fkey.daddr[11] = 0xff;
+		if (bpf_skb_load_bytes(skb, 12, &fkey.saddr[12], 4) ||
+		    bpf_skb_load_bytes(skb, 16, &fkey.daddr[12], 4))
 			return 1;
 	} else if (version == 6) {
-		if (bpf_skb_load_bytes(skb, 8, key.addr, 16))
+		if (bpf_skb_load_bytes(skb, 8, fkey.saddr, 16) ||
+		    bpf_skb_load_bytes(skb, 24, fkey.daddr, 16))
 			return 1;
 	} else {
 		return 1;
 	}
 
-	key.netns = so->netns;
-	key.proto = sk->protocol;
-	if (packet_source_port(skb, version, key.proto, &key.port))
+	fkey.netns = so->netns;
+	fkey.proto = sk->protocol;
+	if (packet_ports(skb, version, fkey.proto, &fkey.sport, &fkey.dport))
 		return 1;
+	key.netns = fkey.netns;
+	__builtin_memcpy(key.addr, fkey.saddr, sizeof(key.addr));
+	key.port = fkey.sport;
+	key.proto = fkey.proto;
 
 	// Check the maps on every packet rather than remembering what this
 	// socket published: the source address and port can change (a UDP
@@ -255,6 +293,15 @@ int egress(struct __sk_buff *skb)
 	struct conn_cgroup *cg_published = bpf_map_lookup_elem(&conn_cgroups, &key);
 	if (!cg_published || __builtin_memcmp(cg_published, &cg, sizeof(cg)))
 		bpf_map_update_elem(&conn_cgroups, &key, &cg, BPF_ANY);
+
+	struct conn_flow flow = {
+		.owner = so->owner,
+		.cgroup_id = cg.cgroup_id,
+	};
+	struct conn_flow *flow_published = bpf_map_lookup_elem(&conn_flows, &fkey);
+	if (!flow_published ||
+	    __builtin_memcmp(flow_published, &flow, sizeof(flow)))
+		bpf_map_update_elem(&conn_flows, &fkey, &flow, BPF_ANY);
 	return 1;
 }
 

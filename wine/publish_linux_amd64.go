@@ -17,9 +17,13 @@ import (
 const (
 	wineABI      uint32 = 2
 	flowsPin            = "wine_flows"
+	peerFlowsPin        = "wine_peer_flows"
 	abiPin              = "wine_abi"
 	heartbeatPin        = "wine_heartbeat"
 	beatInterval        = time.Second
+	// Optional features, at key 1 of wine_abi. Readers that only know key 0
+	// are unaffected by them.
+	wineFeaturePeerFlows uint32 = 1 << 0
 	// Readers treat a heartbeat older than this as a dead publisher, so an
 	// older pin can only be a crashed observer's.
 	heartbeatLimit = 5 * time.Second
@@ -34,6 +38,7 @@ type publication struct {
 	version   *ebpf.Map
 	heartbeat *ebpf.Map
 	flows     *ebpf.Map
+	peerFlows *ebpf.Map
 	pins      map[string]pinID
 	mu        sync.Mutex
 }
@@ -90,7 +95,7 @@ func claim(dir string) error {
 			return errors.New("another Wine publisher is active in " + dir)
 		}
 	}
-	for _, name := range []string{flowsPin, heartbeatPin, abiPin} {
+	for _, name := range []string{flowsPin, peerFlowsPin, heartbeatPin, abiPin} {
 		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -99,12 +104,12 @@ func claim(dir string) error {
 }
 
 // publish pins wine_flows last, which is the publication point, as conn_owners
-// is for socketowner: a reader finding it also finds the other two.
+// is for socketowner: a reader finding it also finds the others.
 func publish(coll *ebpf.Collection, dir string, gid int) (_ *publication, err error) {
 	if err := claim(dir); err != nil {
 		return nil, err
 	}
-	version, err := ebpf.NewMap(&ebpf.MapSpec{Name: abiPin, Type: ebpf.Array, KeySize: 4, ValueSize: 4, MaxEntries: 1})
+	version, err := ebpf.NewMap(&ebpf.MapSpec{Name: abiPin, Type: ebpf.Array, KeySize: 4, ValueSize: 4, MaxEntries: 2})
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +124,7 @@ func publish(coll *ebpf.Collection, dir string, gid int) (_ *publication, err er
 		version:   version,
 		heartbeat: heartbeat,
 		flows:     coll.Maps[flowsPin],
+		peerFlows: coll.Maps[peerFlowsPin],
 		pins:      make(map[string]pinID),
 	}
 	defer func() {
@@ -127,6 +133,9 @@ func publish(coll *ebpf.Collection, dir string, gid int) (_ *publication, err er
 		}
 	}()
 	if err := version.Update(uint32(0), wineABI, ebpf.UpdateAny); err != nil {
+		return nil, err
+	}
+	if err := version.Update(uint32(1), wineFeaturePeerFlows, ebpf.UpdateAny); err != nil {
 		return nil, err
 	}
 	if err := version.Freeze(); err != nil {
@@ -249,7 +258,8 @@ func (p *publication) ensurePinsLocked() error {
 	if err := p.stamp(); err != nil {
 		return err
 	}
-	for _, name := range []string{abiPin, flowsPin} {
+	// wine_flows goes last: it is the publication point.
+	for _, name := range []string{abiPin, peerFlowsPin, flowsPin} {
 		path := filepath.Join(p.dir, name)
 		id, err := pinIDOf(path)
 		if err == nil && id == p.pins[name] {
@@ -258,10 +268,7 @@ func (p *publication) ensurePinsLocked() error {
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		m := p.version
-		if name == flowsPin {
-			m = p.flows
-		}
+		m := map[string]*ebpf.Map{abiPin: p.version, peerFlowsPin: p.peerFlows, flowsPin: p.flows}[name]
 		if m == nil {
 			return fmt.Errorf("map %s is not loaded", name)
 		}
@@ -313,7 +320,7 @@ func (p *publication) close() {
 		p.heartbeat.Update(uint32(0), uint64(0), ebpf.UpdateAny)
 	}
 	// The publication point goes first, as readers look for it.
-	for _, name := range []string{flowsPin, heartbeatPin, abiPin} {
+	for _, name := range []string{flowsPin, peerFlowsPin, heartbeatPin, abiPin} {
 		if id, ok := p.pins[name]; ok {
 			removeOwn(filepath.Join(p.dir, name), id)
 		}

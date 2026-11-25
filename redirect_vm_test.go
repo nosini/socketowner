@@ -74,6 +74,11 @@ func TestRedirectSourcePort(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer owners.Close()
+	flows, err := ebpf.LoadPinnedMap(filepath.Join(pin, "maps", flowMapName), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer flows.Close()
 	run := func(t *testing.T, command string, args ...string) {
 		t.Helper()
 		if output, err := exec.Command(command, args...).CombinedOutput(); err != nil {
@@ -215,6 +220,14 @@ func TestRedirectSourcePort(t *testing.T) {
 				t.Logf("socket port %d, redirected port %d, owner %d", originalPort, peer.Port(), owner.TGID)
 				if err != nil || owner.TGID != uint32(os.Getpid()) {
 					t.Errorf("owner = %+v, lookup error = %v; want PID %d", owner, err, os.Getpid())
+				}
+				// conn_flows names the redirected packet's destination, the
+				// listener, and its translated source port.
+				fkey := flowKey{Netns: cookie, Saddr: peer.Addr().As16(), Daddr: netip.MustParseAddr(loopback).As16(),
+					Sport: peer.Port(), Dport: uint16(port), Proto: ipProtocol}
+				var flow flowValue
+				if err := flows.Lookup(&fkey, &flow); err != nil || flow.TGID != uint32(os.Getpid()) {
+					t.Errorf("flow = %+v, lookup error = %v; want PID %d", flow, err, os.Getpid())
 				}
 			}
 		})

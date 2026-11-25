@@ -58,6 +58,11 @@ func TestEgressDropsRecordOnPortReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer flows.Close()
+	peerFlows, err := ebpf.LoadPinnedMap(filepath.Join(dir, peerFlowsPin), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peerFlows.Close()
 
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -89,6 +94,19 @@ func TestEgressDropsRecordOnPortReuse(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	loopback := netip.MustParseAddr("127.0.0.1").As16()
+	peerKey := func(destinationPort uint16) flowKey {
+		return flowKey{NetNS: host, Source: loopback, Destination: loopback, SourcePort: uint16(port),
+			DestinationPort: destinationPort, Protocol: unix.IPPROTO_UDP}
+	}
+	// The flow the native socket sends is dropped; the same port's flow to
+	// another peer is another socket's and stays.
+	peerReused, peerOther := peerKey(9), peerKey(10)
+	for _, k := range []flowKey{peerReused, peerOther} {
+		if err := peerFlows.Update(k, record, ebpf.UpdateAny); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := unix.Sendto(fd, []byte("x"), 0, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}, Port: 9}); err != nil {
 		t.Fatal(err)
 	}
@@ -99,4 +117,18 @@ func TestEgressDropsRecordOnPortReuse(t *testing.T) {
 	if err := flows.Lookup(control, &value); err != nil {
 		t.Fatalf("unrelated record removed: %v", err)
 	}
+	if err := peerFlows.Lookup(peerReused, &value); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("peer record kept after a native socket sent the flow: %v", err)
+	}
+	if err := peerFlows.Lookup(peerOther, &value); err != nil {
+		t.Fatalf("peer record of another destination removed: %v", err)
+	}
+}
+
+type flowKey struct {
+	NetNS                       uint64
+	Source, Destination         [16]byte
+	SourcePort, DestinationPort uint16
+	Protocol                    uint8
+	Pad                         [3]byte
 }

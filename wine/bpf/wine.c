@@ -222,6 +222,20 @@ struct {
 	__type(key, struct conn_key);
 	__type(value, struct owner);
 } wine_flows SEC(".maps");
+// Public: wine_flows keyed by destination too, as socketowner's conn_flows,
+// so that sockets sharing a source address and port keep their own records.
+struct flow_key {
+	__u64 netns;
+	__u8 source[16], destination[16];
+	__u16 source_port, destination_port;
+	__u8 protocol, pad[3];
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct flow_key);
+	__type(value, struct owner);
+} wine_peer_flows SEC(".maps");
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 8192);
@@ -849,8 +863,9 @@ SEC("cgroup_skb/egress")
 int wine_egress(struct __sk_buff *skb)
 {
 	struct storage *s;
-	struct owner *published;
+	struct owner *published, *peer_published;
 	struct conn_key key = {};
+	struct flow_key peer = {};
 	struct flow f = {};
 	struct bpf_sock *sk = skb->sk;
 	if (!sk)
@@ -872,16 +887,28 @@ int wine_egress(struct __sk_buff *skb)
 	__builtin_memcpy(key.address, f.source, 16);
 	key.port = f.source_port;
 	key.protocol = f.protocol;
+	peer.netns = f.netns;
+	__builtin_memcpy(peer.source, f.source, 16);
+	__builtin_memcpy(peer.destination, f.destination, 16);
+	peer.source_port = f.source_port;
+	peer.destination_port = f.destination_port;
+	peer.protocol = f.protocol;
 	published = bpf_map_lookup_elem(&wine_flows, &key);
+	peer_published = bpf_map_lookup_elem(&wine_peer_flows, &peer);
 	if (!s) {
-		// The port passed to a socket with no Windows identity.
+		// The port, or this flow, passed to a socket with no Windows
+		// identity.
 		if (published)
 			bpf_map_delete_elem(&wine_flows, &key);
+		if (peer_published)
+			bpf_map_delete_elem(&wine_peer_flows, &peer);
 		return 1;
 	}
 	// Active flows republish after LRU eviction, as conn_owners does.
 	if (!published || published->socket_id != s->owner.socket_id)
 		bpf_map_update_elem(&wine_flows, &key, &s->owner, BPF_ANY);
+	if (!peer_published || peer_published->socket_id != s->owner.socket_id)
+		bpf_map_update_elem(&wine_peer_flows, &peer, &s->owner, BPF_ANY);
 	if (!__sync_val_compare_and_swap(&s->first_egress, 0, 1))
 		emit(s, 4, &f);
 	return 1;

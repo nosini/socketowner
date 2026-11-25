@@ -18,17 +18,21 @@ func TestEmbeddedObjectLayout(t *testing.T) {
 		typ  ebpf.MapType
 		size int
 	}{
-		"wine_config":   {ebpf.Array, binary.Size(observerConfig{})},
-		"wine_sockets":  {ebpf.SkStorage, binary.Size(rawOwner{}) + 32},
-		"relay_flows":   {ebpf.LRUHash, binary.Size(rawOwner{}) + 32},
-		"wine_flows":    {ebpf.LRUHash, binary.Size(rawOwner{})},
-		"pasta_targets": {ebpf.TaskStorage, binary.Size(pastaTarget{})},
-		"dns_forwards":  {ebpf.LRUHash, binary.Size(dnsForward{})},
+		"wine_config":     {ebpf.Array, binary.Size(observerConfig{})},
+		"wine_sockets":    {ebpf.SkStorage, binary.Size(rawOwner{}) + 32},
+		"relay_flows":     {ebpf.LRUHash, binary.Size(rawOwner{}) + 32},
+		"wine_flows":      {ebpf.LRUHash, binary.Size(rawOwner{})},
+		"wine_peer_flows": {ebpf.LRUHash, binary.Size(rawOwner{})},
+		"pasta_targets":   {ebpf.TaskStorage, binary.Size(pastaTarget{})},
+		"dns_forwards":    {ebpf.LRUHash, binary.Size(dnsForward{})},
 	} {
 		m := spec.Maps[name]
 		if m == nil || m.Type != want.typ || int(m.ValueSize) != want.size {
 			t.Fatalf("map %s: %+v, expected size %d", name, m, want.size)
 		}
+	}
+	if spec.Maps["wine_flows"].KeySize != 32 || spec.Maps["wine_peer_flows"].KeySize != 48 {
+		t.Fatal("unexpected routing map key size")
 	}
 	if binary.Size(rawEvent{}) != 1152 || binary.Size(rawOwner{}) != 1088 {
 		t.Fatal("unexpected userspace structure layout")

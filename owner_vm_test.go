@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -253,5 +254,85 @@ func TestAcceptedEgressPublishesNoOwner(t *testing.T) {
 	}
 	if got.TGID != 0 {
 		t.Fatalf("accepted socket published owner %+v, want TGID 0", got)
+	}
+}
+
+type flowKey struct {
+	Netns        uint64
+	Saddr, Daddr [16]byte
+	Sport, Dport uint16
+	Proto        uint8
+	Pad          [3]byte
+}
+
+type flowValue struct {
+	TGID, UID uint32
+	BootNS    uint64
+	CgroupID  uint64
+}
+
+// Sockets with different peers may share a source address and port. conn_owners
+// holds only the last one to send; conn_flows keeps each under its destination.
+func TestFlowsSharedSourcePort(t *testing.T) {
+	cgroup, pin := isolatedTestEnv(t)
+	if err := attach(cgroup, pin, true, -1); err != nil {
+		t.Fatal(err)
+	}
+	flows := loadPinned(t, pin, flowMapName)
+	owners := loadPinned(t, pin, mapName)
+	var port int
+	var files []*os.File
+	for _, destination := range []string{"127.0.0.2", "127.0.0.3"} {
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file := os.NewFile(uintptr(fd), "udp")
+		defer file.Close()
+		files = append(files, file)
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Bind(fd, &unix.SockaddrInet4{Port: port, Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+			t.Fatal(err)
+		}
+		if port == 0 {
+			local, err := unix.Getsockname(fd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			port = local.(*unix.SockaddrInet4).Port
+		}
+		if err := unix.Connect(fd, &unix.SockaddrInet4{Port: 9, Addr: netip.MustParseAddr(destination).As4()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := unix.Write(int(files[0].Fd()), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	// Another process sends on the second socket; with -exec-paths, its
+	// connected send records it as that socket's owner.
+	child := exec.Command("/bin/sh", "-c", "printf x >&3")
+	child.ExtraFiles = []*os.File{files[1]}
+	if output, err := child.CombinedOutput(); err != nil {
+		t.Fatalf("%s: %v", output, err)
+	}
+	cookie := testNetNSCookie(t)
+	source := netip.MustParseAddr("127.0.0.1").As16()
+	for destination, want := range map[string]uint32{
+		"127.0.0.2": uint32(os.Getpid()),
+		"127.0.0.3": uint32(child.Process.Pid),
+	} {
+		key := flowKey{Netns: cookie, Saddr: source, Daddr: netip.MustParseAddr(destination).As16(),
+			Sport: uint16(port), Dport: 9, Proto: unix.IPPROTO_UDP}
+		var flow flowValue
+		if err := flows.Lookup(&key, &flow); err != nil || flow.TGID != want || flow.CgroupID == 0 {
+			t.Errorf("%s: flow = %+v, %v; want TGID %d with a cgroup", destination, flow, err, want)
+		}
+	}
+	var owner ownerValue
+	key := ownerKey{NetNS: cookie, Addr: source, Port: uint16(port), Proto: unix.IPPROTO_UDP}
+	if err := owners.Lookup(&key, &owner); err != nil || owner.TGID != uint32(child.Process.Pid) {
+		t.Errorf("conn_owners = %+v, %v; want the last sender %d", owner, err, child.Process.Pid)
 	}
 }

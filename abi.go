@@ -22,15 +22,18 @@ const (
 	abiFeatureConnCgroups uint32 = 1 << 0
 	// cgroup_paths names those cgroups; recorded with -exec-paths.
 	abiFeatureCgroupPaths uint32 = 1 << 1
+	// conn_flows holds owners and cgroups keyed by source and destination.
+	abiFeatureConnFlows uint32 = 1 << 2
 )
 
 // abiFeatures returns the features a loader with or without -exec-paths
 // publishes.
 func abiFeatures(execPaths bool) uint32 {
+	features := abiFeatureConnCgroups | abiFeatureConnFlows
 	if execPaths {
-		return abiFeatureConnCgroups | abiFeatureCgroupPaths
+		features |= abiFeatureCgroupPaths
 	}
-	return abiFeatureConnCgroups
+	return features
 }
 
 // validateMapABI checks the public maps before loading an embedded object.
@@ -43,6 +46,7 @@ func validateMapABI(spec *ebpf.CollectionSpec, execPaths bool) error {
 	want := map[string]mapLayout{
 		mapName:       {ebpf.LRUHash, 32, 16},
 		cgroupMapName: {ebpf.LRUHash, 32, 24},
+		flowMapName:   {ebpf.LRUHash, 48, 24},
 	}
 	if execPaths {
 		want = map[string]mapLayout{
