@@ -125,3 +125,18 @@ Build and distribute the loader from this repository, including both license fil
 Deployments install or update this binary explicitly, then restart its service.
 Service units, SELinux policy and reader-group setup belong to
 [hardened-proxy-service](https://github.com/nosini/hardened-proxy-service).
+
+## Releases
+
+The openSUSE packages in
+[home:Nosini:proxy](https://build.opensuse.org/project/show/home:Nosini:proxy) build
+release tags, `vX.Y.Z`, as version `X.Y.Z`. Tag a commit on `main` and push the tag:
+
+```sh
+git tag -s v1.0.1 -m 'socketowner 1.0.1'
+git push origin v1.0.1
+```
+
+`.github/workflows/obs.yml` then sets the tag as the revision of the package's
+`_service` on src.opensuse.org, which OBS builds. It needs the `OBS_GIT_TOKEN` secret,
+a src.opensuse.org access token that can write to `Nosini/socketowner`.
