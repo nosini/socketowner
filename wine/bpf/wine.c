@@ -46,7 +46,7 @@
 // pasta handles a SYN as soon as it reads the TAP; older records are leftovers.
 #define RELAY_TTL_NS 2000000000ULL
 
-struct inode { unsigned short i_mode; } __attribute__((preserve_access_index));
+struct inode { unsigned short i_mode; unsigned long i_ino; } __attribute__((preserve_access_index));
 struct qstr { const unsigned char *name; unsigned int len; } __attribute__((preserve_access_index));
 struct dentry { struct qstr d_name; } __attribute__((preserve_access_index));
 struct path { struct dentry *dentry; } __attribute__((preserve_access_index));
@@ -169,12 +169,20 @@ struct {
 	__type(key, __u32);
 	__type(value, struct config);
 } wine_config SEC(".maps");
-// Keyed by the pipe's inode. A reused inode is safe: wineserver can't read a
-// request before its client's write has replaced the entry.
+// Keyed by the pipe's inode, by address and number. Entries outlive their
+// pipes, and the kernel reuses a freed inode's memory for new pipes; the
+// address alone made any process writing to such a pipe a client of a
+// wineserver that once read the old one, so that all its sockets were
+// labelled. pipefs numbers each new inode afresh, so the pair names one pipe.
+// A pipe wineserver reads is still safe to reuse: it can't read a request
+// before its client's write has replaced the entry.
+struct pipe_key {
+	__u64 inode, ino;
+};
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 65536);
-	__type(key, __u64);
+	__type(key, struct pipe_key);
 	__type(value, struct process_id);
 } request_pipes SEC(".maps");
 // The client each wineserver last read a request from.
@@ -428,14 +436,15 @@ int BPF_PROG(wine_file, struct file *file, int mask, int ret)
 	struct inode *inode;
 	struct process_id *pipe, id = {};
 	struct client *c;
-	__u64 key;
+	struct pipe_key key = {};
 	__u32 tgid, zero = 0;
 	if (ret)
 		return ret;
 	inode = file->f_inode;
 	if (!inode || (inode->i_mode & S_IFMT) != S_IFIFO || !(mask & (MAY_READ | MAY_WRITE)))
 		return 0;
-	key = (__u64)inode;
+	key.inode = (__u64)inode;
+	key.ino = inode->i_ino;
 	task = bpf_get_current_task_btf();
 	tgid = bpf_get_current_pid_tgid() >> 32;
 	if (is_server()) {

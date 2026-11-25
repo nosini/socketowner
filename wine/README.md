@@ -98,7 +98,10 @@ protocol:
    (`lsm/file_permission`). A pipe read for the first time names nobody until
    its client writes, so a socket created before then is `no-client`, not the
    client of an earlier request. The pipe's record also names the wineserver
-   that read it.
+   that read it. Records outlive their pipes, and the kernel reuses a freed
+   pipe inode's memory, so a record is keyed by the inode's address and its
+   number, which is new for every pipe: a process writing to a later pipe at
+   the same address does not become a client.
 2. Each later read records the client being served. wineserver is single-threaded
    and handles a request within the read which fetched it, so the sockets which
    follow are that client's (`lsm/socket_post_create`).

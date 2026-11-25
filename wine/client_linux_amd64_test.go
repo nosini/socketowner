@@ -64,6 +64,10 @@ func runHelper(role string) {
 		err = clientHelper(os.Getenv(helperFork) == "1")
 	case "plain":
 		err = plainHelper()
+	case "pipe-server":
+		err = pipeServerHelper()
+	case "pipe-writer":
+		err = pipeWriterHelper()
 	default:
 		err = fmt.Errorf("unknown role %q", role)
 	}
@@ -631,5 +635,109 @@ func TestForkedChildNotLabelled(t *testing.T) {
 		if e.ActorTGID == childPID {
 			t.Fatalf("the forked child produced a %s event: %+v", e.Type, e)
 		}
+	}
+}
+
+// recycledPipes is how many pipes each side of the recycled-pipe test opens:
+// enough that some of the writer's land on inodes the server's left behind.
+const recycledPipes = 3000
+
+// pinToFirstCPU keeps the helpers' pipe inodes in one CPU's slab cache, where
+// a freed inode is reused soonest.
+func pinToFirstCPU() error {
+	var set unix.CPUSet
+	set.Set(0)
+	return unix.SchedSetaffinity(0, &set)
+}
+
+// pipeServerHelper is named wineserver and reads from many pipes, which it
+// then closes, so that their freed inodes are reused for later pipes.
+func pipeServerHelper() error {
+	if err := pinToFirstCPU(); err != nil {
+		return err
+	}
+	name := append([]byte("wineserver"), 0)
+	if err := unix.Prctl(unix.PR_SET_NAME, uintptr(unsafe.Pointer(&name[0])), 0, 0, 0); err != nil {
+		return err
+	}
+	var buf [1]byte
+	for range recycledPipes {
+		var fds [2]int
+		if err := unix.Pipe2(fds[:], unix.O_NONBLOCK|unix.O_CLOEXEC); err != nil {
+			return err
+		}
+		unix.Read(fds[0], buf[:])
+		unix.Close(fds[0])
+		unix.Close(fds[1])
+	}
+	return nil
+}
+
+// pipeWriterHelper is no Wine client: it writes to pipes of its own, which
+// may reuse the inodes of pipes a wineserver read, and then sends from a
+// socket.
+func pipeWriterHelper() error {
+	if err := pinToFirstCPU(); err != nil {
+		return err
+	}
+	var limit unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
+		return err
+	}
+	limit.Cur = limit.Max
+	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
+		return err
+	}
+	for range recycledPipes {
+		var fds [2]int
+		if err := unix.Pipe2(fds[:], unix.O_CLOEXEC); err != nil {
+			return err
+		}
+		if _, err := unix.Write(fds[1], []byte("x")); err != nil {
+			return err
+		}
+	}
+	packet, err := net.Dial("udp", os.Getenv(helperUDP))
+	if err != nil {
+		return err
+	}
+	defer packet.Close()
+	if _, err := packet.Write([]byte("probe")); err != nil {
+		return err
+	}
+	if err := announce("udp", packet.LocalAddr().(*net.UDPAddr).Port); err != nil {
+		return err
+	}
+	blockUntilKilled()
+	return nil
+}
+
+// The kernel reuses a freed pipe inode's memory for new pipes. A process that
+// writes to such a pipe must not become a client of the wineserver that read
+// the old one: every socket it created would then be labelled.
+func TestRecycledPipeNotLabelled(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to load the observer")
+	}
+	_, udp := listenLocal(t)
+	log, _ := startObserver(t)
+	for round := range 5 {
+		server := startHelper(t, "pipe-server", nil)
+		if err := server.process.Wait(); err != nil {
+			t.Fatalf("pipe server: %v", err)
+		}
+		// Inodes are freed after an RCU grace period.
+		time.Sleep(time.Second)
+		writer := startHelper(t, "pipe-writer", map[string]string{helperUDP: udp})
+		writer.await(t, "udp")
+		time.Sleep(300 * time.Millisecond)
+		pid := uint32(writer.process.Process.Pid)
+		for _, e := range log.snapshot() {
+			if e.ActorTGID == pid || e.ClientTGID == pid {
+				t.Fatalf("round %d: a process writing to recycled pipes was labelled: %+v", round, e)
+			}
+		}
+		writer.process.Process.Kill()
+		writer.process.Wait()
 	}
 }
