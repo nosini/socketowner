@@ -13,7 +13,25 @@ binary, removing it and installing this one.
 
 ## Installing and using
 
-Install a separately built `socketowner` binary:
+On openSUSE Tumbleweed, the
+[home:Nosini:proxy](https://build.opensuse.org/project/show/home:Nosini:proxy)
+repository builds the loader from `main`, with its BPF programs compiled from source, as
+`/usr/bin/socketowner`; `socketowner-wine-observer` holds the [Wine observer](wine/README.md):
+
+```sh
+sudo zypper ar -p 90 -f https://download.opensuse.org/repositories/home:/Nosini:/proxy/openSUSE_Tumbleweed/ nosini-proxy
+sudo zypper ref nosini-proxy
+sudo zypper in socketowner
+```
+
+The packages install only the executables. The units, reader permissions and SELinux
+policy come with `hardened-proxy-service` from the same repository, which recommends
+this package; see its
+[installation notes](https://github.com/nosini/hardened-proxy-service#installing-on-opensuse-tumbleweed).
+The repository's priority matters because its `mihomo` replaces openSUSE's. The commands
+below use the path of a build installed by hand, `/usr/local/bin/socketowner`.
+
+Elsewhere, install a separately built `socketowner` binary:
 
 ```sh
 sudo install -m 755 socketowner /usr/local/bin/socketowner
