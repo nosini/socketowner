@@ -224,9 +224,9 @@ after LRU eviction. A reader must:
 1. Check the version, map types and sizes before any lookup, as for v1.
 2. Consult `wine_peer_flows` first when the flow's destination is known, then
    `wine_flows`. No record means ordinary lookup proceeds. A `wine_flows` record
-   can be another socket's on the same port: if the socket's owner is known and
-   is neither the record's wineserver nor its client, the record isn't the
-   flow's.
+   can still be another socket's on the same port; its TGIDs cannot tell, because
+   a relayed record names the sandbox's wineserver and client rather than the
+   pasta owning the socket.
 3. Treat a record with another status, a heartbeat older than five seconds, or an
    image failing the validation above as **unknown**, not as absent. Falling
    through would name the relay, or whichever process now holds a reused port.
