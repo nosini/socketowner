@@ -108,11 +108,15 @@ protocol:
    public Windows x86-64 layouts, not Wine's. If the path can't be read yet, the
    client stays `no-image` and is retried on its next request; it does not fall
    back to a mapped name.
-4. 32-bit programs run as true 32-bit Linux processes on the tested runners, so
-   GS is glibc's TLS and that check fails. Encoding 1 is used only for such a
-   client: the first mapping by address whose Linux file name ends in `.exe`.
-   That gives a file name but not the path, and no Windows PID. The first such
-   mapping need not be the program's image, so the name can be wrong.
+4. Under old-style WOW64, the default of a Wine with 32-bit Unix libraries,
+   32-bit programs run as true 32-bit Linux processes, so GS is glibc's TLS and that check fails.
+   Encoding 1 is used only for such a client: the first mapping by address
+   whose Linux file name ends in `.exe`. That gives a file name but not the
+   path, and no Windows PID. The first such mapping need not be the program's
+   image, so the name can be wrong. Under new-style WOW64 (a `WINEARCH=wow64`
+   prefix, or a Wine built with `--enable-archs=i386,x86_64`) a 32-bit program runs
+   in a 64-bit Linux process whose GS holds the 64-bit TEB, so step 3 applies
+   and it is named by full path, with its Windows PID.
 
 A Windows program also opens sockets in its own Linux process: the glibc
 resolver behind `getaddrinfo`, GStreamer, libldap. The same
@@ -226,8 +230,8 @@ A crash leaves the pins, which a new publisher replaces once the heartbeat has
 expired. While no observer runs, new flows have no record and show only as pasta.
 A rule for the sandbox's pasta name can decide what those may do; it also matches
 the sandbox's identified flows, so place it after rules for its programs.
-`WINE-PROCESS-PATH` rules can't match a 32-bit client's full path, because it
-isn't known.
+`WINE-PROCESS-PATH` rules can't match the full path of a 32-bit client under
+old-style WOW64, because it isn't known.
 
 ### Evolution
 
@@ -299,7 +303,8 @@ unknown results by racing another program to one destination.
 ## Validation
 
 [Always-on validation](validation/always-on/README.md) covers this design, with
-real pasta, mihomo, nftables and `sandbox-game`. [NIKKE's launcher](validation/nikke/README.md) was observed on the desktop, without
+real pasta, mihomo, nftables and `sandbox-game`. [Relay validation](validation/relay/README.md)
+adds IPv6 through the relay, new-style WOW64 and relay load. [NIKKE's launcher](validation/nikke/README.md) was observed on the desktop, without
 routing. Earlier reports are history: the
 [first observer](validation/README.md), [routing](validation/routing/README.md),
 [sandbox](validation/sandbox/README.md) and
@@ -322,13 +327,23 @@ python3 wine/testdata/real-wine.py --runner /path/to/runner/bin --observer /abso
 python3 wine/testdata/pasta-route.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/route
 python3 wine/testdata/sandbox-route.py --sandbox /path/to/run-in-sandbox --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/sandbox
 python3 wine/testdata/pasta-dns.py --observer /absolute/path/socketowner-wine-observer --work /absolute/task/dns
+python3 wine/testdata/pasta-relay.py --runner /path/to/runner/bin --observer /absolute/path/socketowner-wine-observer --mihomo /absolute/path/mihomo --work /absolute/task/relay --family 6 --load
 ```
 
 `pasta-route.py --control` repeats its run without the relay, where no rule may see
 a Windows name. `sandbox-route.py --bits 32` uses 32-bit probes. Add `--observer-service` to
 exercise the installed systemd observer (restarts it and leaves it running),
 including its SELinux domain and shared routing maps. Probes need Wine's
-`winegcc` or mingw.
+`winegcc` or mingw. `real-wine.py` and `pasta-route.py` expect Winelib images
+named `.exe`; Wine builds which report `.exe.so` fail their name checks.
+
+`pasta-relay.py` uses mingw probes. `--family 6` relays IPv6 through a dummy
+interface, `--bits 32 --wow64` runs 32-bit probes under new-style WOW64, and
+`--load` adds two load phases: programs with separate destinations, where every
+flow must be named after its program, and one shared destination, where a flow
+may be unknown but never named after another program. Each program's rule leads
+to its own SOCKS outbound, which checks the tag the connection carries.
+`--baseline` repeats the first load phase without the observer, for timing.
 
 The wine package's own privileged tests need no Wine at all: a helper process
 named `wineserver` reads a FIFO, a client helper writes it with a fake Windows
@@ -340,8 +355,10 @@ child's, are asserted against the events and `wine_flows`.
 - **Removed tests.** The fixture VM tests modelled wineserver's memory, which is no
   longer read. Exec revocation, nested PID namespaces with no capabilities, FD reuse
   and failed connects on the new capture have only incidental coverage.
-- **Untested:** new-style WOW64, IPv6 through the relay, and load. Native per-packet cost is measured in the
-  [service validation](validation/service/README.md); Wine relay load remains untested.
+- **Per-packet cost.** Native per-packet cost is measured in the
+  [service validation](validation/service/README.md). Relay load showed no
+  throughput difference with the observer, but the test's own servers limit it;
+  `wine_egress` alone is not measured.
 - **A multi-threaded wineserver** would break step 2 of capture. None exists among
   the tested runners; the design has no detection for one yet.
 - **Sockets the client opens itself.** These are labelled with the client's
@@ -361,9 +378,22 @@ child's, are asserted against the events and `wine_flows`.
   which no command line names, where a pasta also maps port 853, because only
   port 53 is translated, and where `--dns-forward` has no `--dns-host`. A rule
   refusing `wine-unknown` must still exempt any it reaches.
-- **32-bit names.** A 32-bit client is named after the first mapped file whose
+- **32-bit names.** Under old-style WOW64, a 32-bit client is named after the first mapped file whose
   Linux name ends in `.exe`, in address order. That need not be the program's
   image, and a Linux file name is not a Windows image name, so the name can be
   wrong. No path is available.
 - **UDP reuse.** A new inner socket reusing a live UDP 4-tuple inherits pasta's
   existing flow, and with it the previous owner until that flow expires.
+- **TCP join race, which can misname a flow.** pasta's connect can delete a
+  destination's TCP record while another CPU is recording the next SYN on it.
+  That SYN's update is lost: its flow finds no record and is `wine-unknown`, or,
+  if a SYN from the record's earlier program creates a new record first, it is
+  named after that program. Under load with several programs sharing one
+  destination, 5 of 44,800 TCP flows were named after the wrong program; with
+  separate destinations, 4 of 48,000 were unknown and none was misnamed.
+  Do not rely on a deny rule for a program whose sandbox runs other programs
+  connecting to the same destinations at the same time.
+- **Shared source ports.** Linux lets sockets with different peers share a local
+  address and port. When an unlabelled socket sends from the address and port of
+  a live pasta socket, it removes that socket's record by design, and the flow
+  shows only as pasta, or as whichever process mihomo finds for that port.
