@@ -222,11 +222,14 @@ generated reset or acknowledgement, changes nothing. Active flows republish
 after LRU eviction. A reader must:
 
 1. Check the version, map types and sizes before any lookup, as for v1.
-2. Consult `wine_peer_flows` first when the flow's destination is known, then
-   `wine_flows`. No record means ordinary lookup proceeds. A `wine_flows` record
-   can still be another socket's on the same port; its TGIDs cannot tell, because
-   a relayed record names the sandbox's wineserver and client rather than the
-   pasta owning the socket.
+2. Consult `wine_peer_flows` when feature bit 0 is set and the flow's
+   destination is known, and `wine_flows` only otherwise. No record means
+   ordinary lookup proceeds. Do not fall back to `wine_flows` after a
+   `wine_peer_flows` miss: the same packet writes both records, so a miss means
+   the flow is not a Windows program's, and the `wine_flows` record on its port
+   is another socket's, republished by that socket's latest packet. Its TGIDs
+   cannot tell, because a relayed record names the sandbox's wineserver and
+   client rather than the pasta owning the socket.
 3. Treat a record with another status, a heartbeat older than five seconds, or an
    image failing the validation above as **unknown**, not as absent. Falling
    through would name the relay, or whichever process now holds a reused port.
@@ -415,4 +418,7 @@ child's, are asserted against the events and `wine_flows`.
   a live pasta socket, it removes that socket's `wine_flows` record by design.
   `wine_peer_flows` keeps the pasta flow's record, so a reader that knows the
   destination still names it; one that reads only `wine_flows` shows the flow
-  only as pasta, or as whichever process it finds for that port.
+  only as pasta, or as whichever process it finds for that port. Conversely,
+  the pasta socket's next packet restores its `wine_flows` record, so a reader
+  that uses `wine_flows` for the unlabelled socket's flow names it after the
+  Windows program.
