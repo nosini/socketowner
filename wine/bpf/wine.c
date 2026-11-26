@@ -53,7 +53,8 @@
 #define RELAY_TRIES 8
 #define READ_ONCE(x) (*(volatile typeof(x) *)&(x))
 
-struct inode { unsigned short i_mode; unsigned long i_ino; } __attribute__((preserve_access_index));
+struct pipe_inode_info;
+struct inode { unsigned short i_mode; unsigned long i_ino; struct pipe_inode_info *i_pipe; } __attribute__((preserve_access_index));
 struct qstr { const unsigned char *name; unsigned int len; } __attribute__((preserve_access_index));
 struct dentry { struct qstr d_name; } __attribute__((preserve_access_index));
 struct path { struct dentry *dentry; } __attribute__((preserve_access_index));
@@ -219,12 +220,15 @@ struct {
 	__type(key, __u32);
 	__type(value, struct client);
 } clients SEC(".maps");
+// Per-thread scratch for building a struct client before atomic publication
+// into clients. Task-local storage (keyed by the running thread) is safe
+// across preemption and sleepable bpf_copy_from_user.
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
 	__type(value, struct client);
-} blank_client SEC(".maps");
+} client_scratch SEC(".maps");
 struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
@@ -419,12 +423,22 @@ static __always_inline int mapped_image(struct task_struct *task, struct client 
 	return found;
 }
 
+static __always_inline long read_user_mem(void *dst, __u32 size, const void *src, int sleepable)
+{
+	if (sleepable)
+		return bpf_copy_from_user(dst, size, src);
+	return bpf_probe_read_user(dst, size, src);
+}
+
 // These offsets are the Windows x86-64 TEB, PEB and process parameters: public
 // layouts, not Wine's. TEB.Self confirms GS holds a TEB. A 64-bit client can
 // fail that check before its GS is set, so such a failure is retried on its
 // next request, and leaves its sockets unknown until then. Only compat (32-bit)
 // tasks use the mapped-image fallback, which can name but not path them.
-static __always_inline void read_client(struct task_struct *task, struct client *c)
+// Callers build into private scratch storage so a failed read never corrupts a
+// published record. When sleepable is non-zero, bpf_copy_from_user faults in
+// swapped-out user pages.
+static __always_inline void read_client(struct task_struct *task, struct client *c, int sleepable)
 {
 	__u64 teb = task->thread.gsbase, self = 0, peb = 0, parameters = 0, buffer = 0, id = 0;
 	__u32 flags = 0;
@@ -435,25 +449,101 @@ static __always_inline void read_client(struct task_struct *task, struct client 
 				c->status = KNOWN;
 			return;
 		}
-		if (!teb || bpf_probe_read_user(&self, 8, (void *)(teb + 0x30)) || self != teb ||
-		    bpf_probe_read_user(&peb, 8, (void *)(teb + 0x60)) || !peb)
+		if (!teb || read_user_mem(&self, 8, (void *)(teb + 0x30), sleepable) || self != teb ||
+		    read_user_mem(&peb, 8, (void *)(teb + 0x60), sleepable) || !peb)
 			return;
-		if (!bpf_probe_read_user(&id, 8, (void *)(teb + 0x40)) && id && id <= 0xffffffff)
+		if (!read_user_mem(&id, 8, (void *)(teb + 0x40), sleepable) && id && id <= 0xffffffff)
 			c->windows_pid = id;
 		c->peb = peb;
 	}
 	peb = c->peb;
-	if (bpf_probe_read_user(&parameters, 8, (void *)(peb + 0x20)) || !parameters ||
-	    bpf_probe_read_user(&flags, 4, (void *)(parameters + 8)) || !(flags & 1) ||
-	    bpf_probe_read_user(&length, 2, (void *)(parameters + 0x60)) ||
-	    bpf_probe_read_user(&buffer, 8, (void *)(parameters + 0x68)) || !buffer)
+	if (read_user_mem(&parameters, 8, (void *)(peb + 0x20), sleepable) || !parameters ||
+	    read_user_mem(&flags, 4, (void *)(parameters + 8), sleepable) || !(flags & 1) ||
+	    read_user_mem(&length, 2, (void *)(parameters + 0x60), sleepable) ||
+	    read_user_mem(&buffer, 8, (void *)(parameters + 0x68), sleepable) || !buffer)
 		return;
 	if (length < 2 || length > IMAGE_BYTES || (length & 1))
 		return;
-	if (bpf_probe_read_user(c->image, length, (void *)buffer))
+	if (read_user_mem(c->image, length, (void *)buffer, sleepable))
 		return;
 	c->image_bytes = length;
 	c->status = KNOWN;
+}
+
+// Updates clients[tgid] atomically from thread-local scratch so readers never
+// observe a half-initialized record (such as server_tgid without
+// server_start_ns) or a failed read zeroing a published KNOWN image.
+static __always_inline void update_client(struct task_struct *task, __u32 tgid, __u64 start_ns,
+					  __u32 server_tgid, __u64 server_start_ns, int sleepable)
+{
+	struct client *c = bpf_map_lookup_elem(&clients, &tgid);
+	struct client *scratch;
+	int same_proc = c && c->start_ns == start_ns;
+	int have_server = server_tgid && server_start_ns;
+	int need_server = have_server &&
+			  (!same_proc || c->server_tgid != server_tgid || c->server_start_ns != server_start_ns);
+	if (same_proc && c->status == KNOWN && !need_server)
+		return;
+	scratch = bpf_task_storage_get(&client_scratch, task, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!scratch)
+		return;
+	if (same_proc) {
+		if (bpf_probe_read_kernel(scratch, sizeof(*scratch), c) || scratch->start_ns != start_ns) {
+			__builtin_memset(scratch, 0, sizeof(*scratch));
+			scratch->start_ns = start_ns;
+			same_proc = 0;
+		}
+	} else {
+		__builtin_memset(scratch, 0, sizeof(*scratch));
+		scratch->start_ns = start_ns;
+	}
+	if (have_server) {
+		scratch->server_tgid = server_tgid;
+		scratch->server_start_ns = server_start_ns;
+	}
+	if (scratch->status != KNOWN)
+		read_client(task, scratch, sleepable);
+	if (!same_proc) {
+		if (!c) {
+			if (bpf_map_update_elem(&clients, &tgid, scratch, BPF_NOEXIST) == 0)
+				goto done;
+		} else {
+			bpf_map_update_elem(&clients, &tgid, scratch, BPF_ANY);
+			goto done;
+		}
+	}
+	// Re-check the published entry so a concurrent thread's progress
+	// (such as resolving KNOWN or recording a wineserver) is never lost.
+	c = bpf_map_lookup_elem(&clients, &tgid);
+	if (!c || c->start_ns != start_ns) {
+		bpf_map_update_elem(&clients, &tgid, scratch, BPF_ANY);
+		goto done;
+	}
+	if (c->status == KNOWN) {
+		if (scratch->status != KNOWN) {
+			if (!have_server ||
+			    (c->server_tgid == server_tgid && c->server_start_ns == server_start_ns))
+				goto done;
+			if (bpf_probe_read_kernel(scratch, sizeof(*scratch), c) || scratch->start_ns != start_ns)
+				goto done;
+			scratch->server_tgid = server_tgid;
+			scratch->server_start_ns = server_start_ns;
+		}
+		bpf_map_update_elem(&clients, &tgid, scratch, BPF_ANY);
+		goto done;
+	}
+	if (!scratch->server_tgid && c->server_tgid && c->server_start_ns) {
+		scratch->server_tgid = c->server_tgid;
+		scratch->server_start_ns = c->server_start_ns;
+	}
+	if (scratch->status == KNOWN ||
+	    scratch->server_tgid != c->server_tgid ||
+	    scratch->server_start_ns != c->server_start_ns ||
+	    scratch->peb != c->peb ||
+	    scratch->windows_pid != c->windows_pid)
+		bpf_map_update_elem(&clients, &tgid, scratch, BPF_ANY);
+done:
+	bpf_task_storage_delete(&client_scratch, task);
 }
 
 SEC("lsm/file_permission")
@@ -462,9 +552,8 @@ int BPF_PROG(wine_file, struct file *file, int mask, int ret)
 	struct task_struct *task;
 	struct inode *inode;
 	struct process_id *pipe, id = {};
-	struct client *c;
 	struct pipe_key key = {};
-	__u32 tgid, zero = 0;
+	__u32 tgid;
 	if (ret)
 		return ret;
 	inode = file->f_inode;
@@ -511,28 +600,32 @@ int BPF_PROG(wine_file, struct file *file, int mask, int ret)
 	id.server_tgid = pipe->server_tgid;
 	id.server_start_ns = pipe->server_start_ns;
 	bpf_map_update_elem(&request_pipes, &key, &id, BPF_EXIST);
-	c = bpf_map_lookup_elem(&clients, &tgid);
-	if (!c || c->start_ns != id.start_ns) {
-		struct client *blank = bpf_map_lookup_elem(&blank_client, &zero);
-		if (!blank)
-			return 0;
-		bpf_map_update_elem(&clients, &tgid, blank, BPF_ANY);
-		c = bpf_map_lookup_elem(&clients, &tgid);
-		if (!c)
-			return 0;
-		c->start_ns = id.start_ns;
-	}
 	// The wineserver which reads this pipe serves this client, so the
-	// client's own sockets can name it. A write with no server named, which
-	// only an evicted pipe record can cause, leaves the record alone:
-	// wine_create refuses to label without a server rather than put the
-	// client's own TGID in the server fields.
-	if (id.server_tgid) {
-		c->server_tgid = id.server_tgid;
-		c->server_start_ns = id.server_start_ns;
-	}
-	if (c->status != KNOWN)
-		read_client(task, c);
+	// client's own sockets can name it. A write with no server named leaves
+	// server fields unset: wine_create refuses to label without a server
+	// rather than put the client's own TGID in the server fields.
+	update_client(task, tgid, id.start_ns, id.server_tgid, id.server_start_ns, 0);
+	return 0;
+}
+
+// Prunes closed pipes from request_pipes once all ends have closed, so exited
+// Wine threads do not accumulate and evict live idle request pipes.
+// pipe_release clears inode->i_pipe before security_file_free runs when the
+// last reader and writer close; while either end stays open, i_pipe remains
+// non-NULL so buffered requests can still be attributed.
+SEC("lsm/file_free_security")
+int BPF_PROG(wine_file_free, struct file *file)
+{
+	struct inode *inode = file->f_inode;
+	struct pipe_key key = {};
+	if (!inode || (inode->i_mode & S_IFMT) != S_IFIFO)
+		return 0;
+	if (inode->i_pipe)
+		return 0;
+	key.inode = (__u64)inode;
+	key.ino = inode->i_ino;
+	if (bpf_map_lookup_elem(&request_pipes, &key))
+		bpf_map_delete_elem(&request_pipes, &key);
 	return 0;
 }
 
@@ -554,7 +647,7 @@ static __always_inline void label_from_client(struct owner *o, struct client *c,
 	o->status = KNOWN;
 }
 
-SEC("lsm/socket_post_create")
+SEC("lsm.s/socket_post_create")
 int BPF_PROG(wine_create, struct socket *socket, int family, int type, int protocol, int kern, int ret)
 {
 	struct task_struct *task;
@@ -579,6 +672,7 @@ int BPF_PROG(wine_create, struct socket *socket, int family, int type, int proto
 	task = bpf_get_current_task_btf();
 	tgid = bpf_get_current_pid_tgid() >> 32;
 	if (!server) {
+		__u64 start_ns = task->group_leader->start_boottime;
 		// A Windows program also opens sockets in its own Linux process:
 		// the resolver behind getaddrinfo, GStreamer, libldap. Reading the
 		// current task and one lookup by TGID are all this path costs
@@ -586,13 +680,21 @@ int BPF_PROG(wine_create, struct socket *socket, int family, int type, int proto
 		// a forked child, which has its own TGID and never wrote a
 		// request, stays unlabelled.
 		c = bpf_map_lookup_elem(&clients, &tgid);
-		if (!c || c->start_ns != task->group_leader->start_boottime)
+		if (!c || c->start_ns != start_ns)
 			return 0;
 		// Only a client whose wineserver is known is labelled: always
-		// the one reading its pipe, unless that record was evicted
-		// before its write. The client's own TGID never names a server.
-		if (!c->server_tgid)
+		// the one reading its pipe. The client's own TGID never names a
+		// server.
+		if (!c->server_tgid || !c->server_start_ns)
 			return 0;
+		// Retry reading the client's PEB/ImagePathName in this sleepable
+		// hook so swapped-out pages are faulted in with bpf_copy_from_user.
+		if (c->status != KNOWN) {
+			update_client(task, tgid, start_ns, c->server_tgid, c->server_start_ns, 1);
+			c = bpf_map_lookup_elem(&clients, &tgid);
+			if (!c || c->start_ns != start_ns || !c->server_tgid || !c->server_start_ns)
+				return 0;
+		}
 	}
 	s = bpf_sk_storage_get(&wine_sockets, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
 	if (!s || s->ready)

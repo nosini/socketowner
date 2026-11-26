@@ -65,24 +65,47 @@ func pinIDOf(path string) (pinID, error) {
 	return pinID{dev: uint64(st.Dev), ino: st.Ino}, nil
 }
 
-// claim refuses a live publisher and clears what a crashed one left. The
-// directory lock only serialises claim, so a stalled publisher can't remove a
-// successor's fresh heartbeat after reading an older one. The heartbeat pin
-// itself is then claimed atomically by publish.
-func claim(dir string) error {
+// lockDir serializes pin claim, publication, heartbeat repair, and cleanup
+// across publishers sharing dir. Holding the lock for each whole operation
+// prevents a stalled publisher from overwriting or deleting a live successor's
+// pins.
+func lockDir(dir string) (*os.File, error) {
 	lock, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err = unix.Flock(int(lock.Fd()), unix.LOCK_EX)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	return lock, nil
+}
+
+func unlockDir(lock *os.File) {
+	if lock == nil {
+		return
+	}
+	_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	lock.Close()
+}
+
+// claim refuses a live publisher and clears what a crashed one left.
+func claim(dir string) error {
+	lock, err := lockDir(dir)
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		if errors.Is(err, unix.EWOULDBLOCK) {
-			return errors.New("another Wine publisher is active in " + dir)
-		}
-		return err
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	defer unlockDir(lock)
+	return claimLocked(dir)
+}
 
+func claimLocked(dir string) error {
 	m, err := ebpf.LoadPinnedMap(filepath.Join(dir, heartbeatPin), &ebpf.LoadPinOptions{ReadOnly: true})
 	if err == nil {
 		defer m.Close()
@@ -91,7 +114,7 @@ func claim(dir string) error {
 		if nowErr != nil {
 			return nowErr
 		}
-		if m.Lookup(uint32(0), &beat) == nil && now-beat < uint64(heartbeatLimit) {
+		if m.Lookup(uint32(0), &beat) == nil && beat != 0 && (beat >= now || now-beat < uint64(heartbeatLimit)) {
 			return errors.New("another Wine publisher is active in " + dir)
 		}
 	}
@@ -104,9 +127,16 @@ func claim(dir string) error {
 }
 
 // publish pins wine_flows last, which is the publication point, as conn_owners
-// is for socketowner: a reader finding it also finds the others.
+// is for socketowner: a reader finding it also finds the others. The directory
+// lock is held across claim and initial publication so no stalled publisher
+// can interleave between clearing stale pins and publishing the new ones.
 func publish(coll *ebpf.Collection, dir string, gid int) (_ *publication, err error) {
-	if err := claim(dir); err != nil {
+	lock, err := lockDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockDir(lock)
+	if err := claimLocked(dir); err != nil {
 		return nil, err
 	}
 	version, err := ebpf.NewMap(&ebpf.MapSpec{Name: abiPin, Type: ebpf.Array, KeySize: 4, ValueSize: 4, MaxEntries: 2})
@@ -129,7 +159,7 @@ func publish(coll *ebpf.Collection, dir string, gid int) (_ *publication, err er
 	}
 	defer func() {
 		if err != nil {
-			p.close()
+			p.closeUnderLock()
 		}
 	}()
 	if err := version.Update(uint32(0), wineABI, ebpf.UpdateAny); err != nil {
@@ -152,11 +182,9 @@ func publish(coll *ebpf.Collection, dir string, gid int) (_ *publication, err er
 		}
 		return nil, err
 	}
-	if err := p.ensurePins(); err != nil {
+	if err := p.ensurePinsUnderLock(); err != nil {
 		return nil, err
 	}
-	// A publisher which was stalled while we claimed may have replaced the
-	// heartbeat before the rest was visible. Then it owns the pins, not us.
 	if ours, err := p.heartbeatOurs(); err != nil {
 		return nil, err
 	} else if !ours {
@@ -236,10 +264,19 @@ func (p *publication) ensurePins() error {
 	return p.ensurePinsLocked()
 }
 
-// ensurePinsLocked re-pins anything a loader cleanup, a crash or a losing
-// publisher removed. Our heartbeat is the right to do so: once another process
-// owns it, this observer stops rather than fight it.
+// ensurePinsLocked acquires the directory lock and re-pins anything a loader
+// cleanup or crash removed. Our heartbeat is the right to do so: once another
+// process owns it, this observer stops rather than overwrite or fight it.
 func (p *publication) ensurePinsLocked() error {
+	lock, err := lockDir(p.dir)
+	if err != nil {
+		return err
+	}
+	defer unlockDir(lock)
+	return p.ensurePinsUnderLock()
+}
+
+func (p *publication) ensurePinsUnderLock() error {
 	heartbeatPath := filepath.Join(p.dir, heartbeatPin)
 	id, err := pinIDOf(heartbeatPath)
 	switch {
@@ -315,8 +352,18 @@ func (p *publication) close() {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	heartbeatPath := filepath.Join(p.dir, heartbeatPin)
-	if id, err := pinIDOf(heartbeatPath); err == nil && id == p.pins[heartbeatPin] {
+	lock, err := lockDir(p.dir)
+	if err == nil {
+		defer unlockDir(lock)
+	}
+	p.closeUnderLock()
+}
+
+func (p *publication) closeUnderLock() {
+	if p == nil {
+		return
+	}
+	if ours, err := p.heartbeatOurs(); err == nil && ours {
 		p.heartbeat.Update(uint32(0), uint64(0), ebpf.UpdateAny)
 	}
 	// The publication point goes first, as readers look for it.

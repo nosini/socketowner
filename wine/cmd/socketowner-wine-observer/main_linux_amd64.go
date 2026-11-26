@@ -59,14 +59,16 @@ func run() error {
 		}
 	}()
 	err := wine.Observe(ctx, options, func(e wine.Event) error {
+		if e.Type == "ready" {
+			if err := notifyReady(); err != nil {
+				return err
+			}
+		}
 		if err := encoder.Encode(e); err != nil {
 			if errors.Is(err, syscall.EPIPE) {
 				brokenPipe.Store(true)
 			}
 			return fmt.Errorf("event output: %w", err)
-		}
-		if e.Type == "ready" {
-			return notifyReady()
 		}
 		return nil
 	})

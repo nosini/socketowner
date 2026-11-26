@@ -9,6 +9,7 @@ package wine
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -21,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +30,7 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
 
@@ -68,6 +71,12 @@ func runHelper(role string) {
 		err = pipeServerHelper()
 	case "pipe-writer":
 		err = pipeWriterHelper()
+	case "client-race":
+		err = clientRaceHelper()
+	case "client-pageout":
+		err = clientPageoutHelper()
+	case "server-two-req":
+		err = serverTwoReqHelper()
 	default:
 		err = fmt.Errorf("unknown role %q", role)
 	}
@@ -230,10 +239,15 @@ func plainHelper() error {
 // the calling thread: the public Windows x86-64 layouts the capture reads, so
 // the observer finds this helper's image and Windows PID.
 func fakeWindowsIdentity(windowsPID uint32, image string) error {
+	_, err := fakeWindowsIdentityMapped(windowsPID, image)
+	return err
+}
+
+func fakeWindowsIdentityMapped(windowsPID uint32, image string) ([]byte, error) {
 	base, err := unix.Mmap(-1, 0, 5*4096, unix.PROT_READ|unix.PROT_WRITE,
 		unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	address := uintptr(unsafe.Pointer(unsafe.SliceData(base)))
 	teb, peb, parameters, buffer := address, address+0x1000, address+0x2000, address+0x3000
@@ -259,9 +273,9 @@ func fakeWindowsIdentity(windowsPID uint32, image string) error {
 	store16(parameters+0x60, uint16(len(encoded)*2)) // ImagePathName.Length
 	_, _, errno := unix.Syscall6(unix.SYS_ARCH_PRCTL, archSetGS, teb, 0, 0, 0, 0)
 	if errno != 0 {
-		return errno
+		return nil, errno
 	}
-	return nil
+	return base, nil
 }
 
 // forkAddress is the sockaddr_in a forked child connects: a global, so its
@@ -739,5 +753,503 @@ func TestRecycledPipeNotLabelled(t *testing.T) {
 		}
 		writer.process.Process.Kill()
 		writer.process.Wait()
+	}
+}
+
+// clientRaceHelper hammers request FIFO writes and client socket creation
+// concurrently from multiple OS threads: half with a valid TEB/PEB and half
+// without GS set, exercising concurrent clients[tgid] initialization and
+// read_client failures racing against KNOWN publication.
+func clientRaceHelper() error {
+	request, err := os.OpenFile(os.Getenv(helperFIFO), os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer request.Close()
+	listener := os.Getenv(helperListener)
+	const workers = 8
+	const rounds = 25
+	ready := make(chan struct{}, workers)
+	start := make(chan struct{})
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := range workers {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			if id%2 == 0 {
+				if err := fakeWindowsIdentity(helperWindows, helperImage); err != nil {
+					errCh <- err
+					return
+				}
+			}
+			ready <- struct{}{}
+			<-start
+			for range rounds {
+				if _, err := request.Write([]byte("r")); err != nil {
+					errCh <- err
+					return
+				}
+				conn, err := net.Dial("tcp", listener)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				conn.Close()
+			}
+		}(i)
+	}
+	for range workers {
+		select {
+		case <-ready:
+		case err := <-errCh:
+			return err
+		}
+	}
+	close(start)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+	if err := announce("done", 0); err != nil {
+		return err
+	}
+	blockUntilKilled()
+	return nil
+}
+
+// Multi-threaded clients concurrently writing request pipes and creating
+// sockets must never crash the observer with ServerStartNS==0 or corrupt a
+// KNOWN image back to no-image.
+func TestConcurrentClientInitAndSockets(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to load the observer")
+	}
+	tcp, udp := listenLocal(t)
+	fifo := filepath.Join(t.TempDir(), "request")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log, _ := startObserver(t)
+	env := map[string]string{helperFIFO: fifo, helperListener: tcp, helperUDP: udp}
+	server := startHelper(t, "server", env)
+	server.await(t, "read")
+	client := startHelper(t, "client-race", env)
+	client.await(t, "done")
+	if _, err := server.stdin.Write([]byte("go")); err != nil {
+		t.Fatal(err)
+	}
+	server.await(t, "socket")
+	serverPID := uint32(server.process.Process.Pid)
+	clientPID := uint32(client.process.Process.Pid)
+
+	waitForEvents(t, log, func(events []Event) error {
+		knownClient := 0
+		knownServer := 0
+		for _, e := range events {
+			if e.Type == "create" && e.ClientTGID == clientPID && e.Status == "known" && e.WindowsName == "alpha.exe" {
+				if e.Creator == "client" {
+					knownClient++
+				} else if e.Creator == "wineserver" {
+					knownServer++
+				}
+			}
+		}
+		if knownClient < 10 || knownServer < 1 {
+			return fmt.Errorf("known creates: client=%d server=%d", knownClient, knownServer)
+		}
+		return nil
+	})
+	sawKnown := false
+	for _, e := range log.snapshot() {
+		if e.Type != "create" || e.ClientTGID != clientPID {
+			continue
+		}
+		if e.ServerTGID != serverPID || e.ServerStartNS == 0 {
+			t.Fatalf("invalid server identity on concurrent create: %+v", e)
+		}
+		if e.Status == "known" {
+			sawKnown = true
+			if e.WindowsName != "alpha.exe" || e.WindowsImage != helperImage {
+				t.Fatalf("corrupted known image: %+v", e)
+			}
+		} else if sawKnown && e.Creator == "wineserver" {
+			t.Fatalf("client regressed from known to %s: %+v", e.Status, e)
+		}
+	}
+}
+
+// clientPageoutHelper maps a fake Windows identity, swaps out the ImagePathName
+// page with MADV_PAGEOUT before writing the FIFO (so non-sleepable
+// file_permission gets -EFAULT), and then creates a socket in its own process
+// so sleepable lsm.s/socket_post_create faults the page in via bpf_copy_from_user.
+func clientPageoutHelper() error {
+	base, err := fakeWindowsIdentityMapped(helperWindows, helperImage)
+	if err != nil {
+		return err
+	}
+	// Page out the ImagePathName buffer page before writing the request FIFO.
+	if err := unix.Madvise(base[0x3000:0x4000], unix.MADV_PAGEOUT); err != nil {
+		return fmt.Errorf("madvise MADV_PAGEOUT: %w", err)
+	}
+	request, err := os.OpenFile(os.Getenv(helperFIFO), os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer request.Close()
+	if _, err := request.Write([]byte("request1")); err != nil {
+		return err
+	}
+	if err := announce("wrote", 0); err != nil {
+		return err
+	}
+	goahead := make([]byte, 1)
+	if _, err := os.Stdin.Read(goahead); err != nil {
+		return err
+	}
+	conn, err := net.Dial("tcp", os.Getenv(helperListener))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := announce("tcp", conn.LocalAddr().(*net.TCPAddr).Port); err != nil {
+		return err
+	}
+	blockUntilKilled()
+	return nil
+}
+
+// serverTwoReqHelper reads a FIFO, creates a socket after signal 1, then reads
+// again and creates a second socket after signal 2.
+func serverTwoReqHelper() error {
+	name := append([]byte("wineserver"), 0)
+	if err := unix.Prctl(unix.PR_SET_NAME, uintptr(unsafe.Pointer(&name[0])), 0, 0, 0); err != nil {
+		return err
+	}
+	fifo, err := unix.Open(os.Getenv(helperFIFO), unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fifo)
+	if os.Getenv("WINE_SKIP_INITIAL_READ") != "1" {
+		if _, err := unix.Read(fifo, make([]byte, 1)); err != nil && !errors.Is(err, unix.EAGAIN) {
+			return err
+		}
+	}
+	if err := announce("ready", 0); err != nil {
+		return err
+	}
+	buf := make([]byte, 1)
+	for i := range 2 {
+		if _, err := os.Stdin.Read(buf); err != nil {
+			return err
+		}
+		if _, err := unix.Read(fifo, make([]byte, 64)); err != nil && !errors.Is(err, unix.EAGAIN) {
+			return err
+		}
+		conn, err := net.Dial("tcp", os.Getenv(helperListener))
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		if err := announce(fmt.Sprintf("socket%d", i+1), conn.LocalAddr().(*net.TCPAddr).Port); err != nil {
+			return err
+		}
+	}
+	blockUntilKilled()
+	return nil
+}
+
+func hasActiveSwap() bool {
+	data, err := os.ReadFile("/proc/swaps")
+	if err != nil {
+		return false
+	}
+	return len(strings.Split(strings.TrimSpace(string(data)), "\n")) > 1
+}
+
+// When ImagePathName is swapped out before file_permission runs, sleepable
+// lsm.s/socket_post_create must fault it back in with bpf_copy_from_user and
+// publish the KNOWN identity for both the client socket and subsequent
+// wineserver sockets.
+func TestSwappedOutImagePageResolvedOnSocketCreate(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to load the observer")
+	}
+	tcp, udp := listenLocal(t)
+	fifo := filepath.Join(t.TempDir(), "request")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log, flows := startObserver(t)
+	env := map[string]string{helperFIFO: fifo, helperListener: tcp, helperUDP: udp}
+	server := startHelper(t, "server-two-req", env)
+	server.await(t, "ready")
+	client := startHelper(t, "client-pageout", env)
+	client.await(t, "wrote")
+	// Trigger first wineserver socket before client creates any socket: with
+	// active swap, MADV_PAGEOUT causes non-sleepable file_permission to miss
+	// the swapped-out ImagePathName page and leave the client no-image.
+	if _, err := server.stdin.Write([]byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	firstSock := server.await(t, "socket1")
+	clientPID := uint32(client.process.Process.Pid)
+	serverPID := uint32(server.process.Process.Pid)
+	host, err := hostNetNS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRec := flowRecord(t, flows, host, firstSock.Port, unix.IPPROTO_TCP)
+	if hasActiveSwap() && firstRec.Status != 3 {
+		t.Logf("note: first socket status=%d (page may have stayed resident)", firstRec.Status)
+	}
+
+	// Now let client create a socket: lsm.s/socket_post_create faults the page in.
+	if _, err := client.stdin.Write([]byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	clientSock := client.await(t, "tcp")
+	// And trigger a second wineserver socket, which now sees KNOWN in clients.
+	if _, err := server.stdin.Write([]byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	secondSock := server.await(t, "socket2")
+
+	for _, port := range []int{clientSock.Port, secondSock.Port} {
+		rec := flowRecord(t, flows, host, port, unix.IPPROTO_TCP)
+		if rec.Status != 1 || rec.ClientTGID != clientPID || rec.ServerTGID != serverPID || rec.WindowsPID != helperWindows {
+			t.Fatalf("port %d not resolved after sleepable read: %+v", port, rec)
+		}
+		image, name, err := windowsImage(rec.Image[:], rec.ImageBytes)
+		if err != nil || image != helperImage || name != "alpha.exe" {
+			t.Fatalf("port %d image %q %q (%v)", port, image, name, err)
+		}
+	}
+	waitForEvents(t, log, func(events []Event) error {
+		for _, e := range events {
+			if e.Type == "create" && e.Creator == "client" && e.ClientTGID == clientPID &&
+				e.Status == "known" && e.WindowsName == "alpha.exe" {
+				return nil
+			}
+		}
+		return errors.New("no known client create event")
+	})
+}
+
+// Closing all ends of a pipe must prune its entry from request_pipes via
+// lsm/file_free_security, while closing only one end must keep the entry so
+// buffered requests can still be read and attributed.
+func TestRequestPipePrunedOnClose(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to load BPF programs")
+	}
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coll.Close()
+	host, err := hostNetNS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coll.Maps["wine_config"].Update(uint32(0), observerConfig{HostNetNS: host}, ebpf.UpdateAny); err != nil {
+		t.Fatal(err)
+	}
+	lFile, err := link.AttachLSM(link.LSMOptions{Program: coll.Programs["wine_file"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lFile.Close()
+	lFree, err := link.AttachLSM(link.LSMOptions{Program: coll.Programs["wine_file_free"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lFree.Close()
+
+	// Create a pipe and read from it under comm "wineserver" on a dedicated OS thread.
+	var fds [2]int
+	if err := unix.Pipe2(fds[:], unix.O_NONBLOCK|unix.O_CLOEXEC); err != nil {
+		t.Fatal(err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fds[0], &st); err != nil {
+		unix.Close(fds[0])
+		unix.Close(fds[1])
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		// Keep the OS thread locked until exit so the Go runtime terminates it
+		// rather than returning a thread named "wineserver" to the pool.
+		runtime.LockOSThread()
+		name := append([]byte("wineserver"), 0)
+		if err := unix.Prctl(unix.PR_SET_NAME, uintptr(unsafe.Pointer(&name[0])), 0, 0, 0); err != nil {
+			readDone <- err
+			return
+		}
+		var b [1]byte
+		_, err := unix.Read(fds[0], b[:])
+		if err != nil && !errors.Is(err, unix.EAGAIN) {
+			readDone <- err
+			return
+		}
+		readDone <- nil
+	}()
+	if err := <-readDone; err != nil {
+		unix.Close(fds[0])
+		unix.Close(fds[1])
+		t.Fatal(err)
+	}
+
+	type pipeKey struct {
+		Inode uint64
+		Ino   uint64
+	}
+	type processID struct {
+		StartNS       uint64
+		ServerStartNS uint64
+		TGID          uint32
+		ServerTGID    uint32
+	}
+	hasPipe := func() bool {
+		iter := coll.Maps["request_pipes"].Iterate()
+		var k pipeKey
+		var v processID
+		for iter.Next(&k, &v) {
+			if k.Ino == st.Ino {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasPipe() {
+		unix.Close(fds[0])
+		unix.Close(fds[1])
+		t.Fatalf("pipe ino %d not recorded in request_pipes", st.Ino)
+	}
+	// Closing only the write end while the read end stays open must keep the entry.
+	unix.Close(fds[1])
+	if !hasPipe() {
+		unix.Close(fds[0])
+		t.Fatalf("pipe ino %d pruned while read end was still open", st.Ino)
+	}
+	// Closing the last end must prune the entry immediately.
+	unix.Close(fds[0])
+	if hasPipe() {
+		t.Fatalf("pipe ino %d remained in request_pipes after both ends closed", st.Ino)
+	}
+}
+
+// When the observer starts while a Wine client pipe already exists and the
+// client writes before any observed wineserver read, the first wineserver
+// socket is labelled no-client (never misattributed), and the client's next
+// write on that pipe names both wineserver and client sockets.
+func TestPreExistingClientPipeAfterObserverStart(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to load the observer")
+	}
+	tcp, udp := listenLocal(t)
+	fifo := filepath.Join(t.TempDir(), "request")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Start server BEFORE observer, skipping initial read so the pipe exists
+	// unopened/unseen by the observer when the client makes its first write.
+	env := map[string]string{
+		helperFIFO:             fifo,
+		helperListener:         tcp,
+		helperUDP:              udp,
+		"WINE_SKIP_INITIAL_READ": "1",
+	}
+	server := startHelper(t, "server-two-req", env)
+	server.await(t, "ready")
+
+	_, flows := startObserver(t)
+
+	// Open the FIFO in a client process and write request 1 before server reads.
+	client := startHelper(t, "client", env)
+	client.await(t, "wrote")
+	// Server reads request 1 -> registers the pipe with tgid=0 -> socket1 is no-client.
+	if _, err := server.stdin.Write([]byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	sock1 := server.await(t, "socket1")
+	host, err := hostNetNS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec1 := flowRecord(t, flows, host, sock1.Port, unix.IPPROTO_TCP)
+	if rec1.Status != 2 { // NO_CLIENT
+		t.Fatalf("first socket on unseen pipe had status %d, want 2 (no-client)", rec1.Status)
+	}
+	// Now a second client write on the same pipe (after server learned it) names the client.
+	client2 := startHelper(t, "client", env)
+	client2.await(t, "wrote")
+	client2TCP := client2.await(t, "tcp")
+	if _, err := server.stdin.Write([]byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	sock2 := server.await(t, "socket2")
+	for _, port := range []int{sock2.Port, client2TCP.Port} {
+		rec := flowRecord(t, flows, host, port, unix.IPPROTO_TCP)
+		if rec.Status != 1 {
+			t.Fatalf("port %d status = %d, want 1 (known)", port, rec.Status)
+		}
+	}
+}
+
+// A blocked diagnostic consumer must not prevent Observe from shutting down
+// promptly on context cancellation and removing its pinned maps.
+func TestObserveBlockedStdoutUnpinsOnCancel(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to load the observer")
+	}
+	dir := pinDir(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	done := make(chan error, 1)
+	go func() {
+		done <- Observe(ctx, Options{Cgroup: "/sys/fs/cgroup", Pin: dir, Group: -1}, func(e Event) error {
+			if e.Type == "ready" {
+				close(ready)
+				close(blocked)
+				<-release
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatal(err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("observer not ready")
+	}
+	<-blocked
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Observe returned error on cancel with blocked stdout: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Observe hung on cancel while stdout consumer was blocked")
+	}
+	for _, name := range []string{flowsPin, peerFlowsPin, abiPin, heartbeatPin} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("pin %s left behind after cancel with blocked stdout: %v", name, err)
+		}
 	}
 }

@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -22,7 +24,87 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const scanInterval = 500 * time.Millisecond
+const (
+	scanInterval     = 500 * time.Millisecond
+	eventQueueSize   = 1024
+	stopFlushTimeout = 250 * time.Millisecond
+)
+
+// eventSink decouples diagnostic event output from the observer's control loop,
+// pasta discovery, and shutdown unpinning. When consume blocks, new events are
+// dropped and counted rather than stalling the observer.
+type eventSink struct {
+	observerID string
+	queue      chan Event
+	done       chan struct{}
+	dropped    atomic.Uint64
+	mu         sync.Mutex
+	errVal     error
+}
+
+func newEventSink(observerID string, capacity int, consume func(Event) error) *eventSink {
+	if capacity < 1 {
+		capacity = 1
+	}
+	s := &eventSink{
+		observerID: observerID,
+		queue:      make(chan Event, capacity),
+		done:       make(chan struct{}),
+	}
+	go func() {
+		defer close(s.done)
+		for e := range s.queue {
+			if err := consume(e); err != nil {
+				s.mu.Lock()
+				if s.errVal == nil {
+					s.errVal = err
+				}
+				s.mu.Unlock()
+				return
+			}
+		}
+	}()
+	return s
+}
+
+// emit enqueues e without blocking, returning any consumer error already seen.
+// When the queue is full, e is dropped and counted for a later loss event.
+func (s *eventSink) emit(e Event) error {
+	if err := s.err(); err != nil {
+		return err
+	}
+	e.Observer = s.observerID
+	select {
+	case s.queue <- e:
+	default:
+		s.dropped.Add(1)
+	}
+	return nil
+}
+
+func (s *eventSink) takeDropped() uint64 {
+	return s.dropped.Swap(0)
+}
+
+func (s *eventSink) err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.errVal
+}
+
+// close finishes diagnostic delivery with a bounded wait so a blocked consumer
+// cannot hang shutdown and prevent pin removal.
+func (s *eventSink) close(timeout time.Duration) error {
+	close(s.queue)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+		return s.err()
+	case <-timer.C:
+		return s.err()
+	}
+}
 
 // lsmPath lists the active Linux security modules.
 const lsmPath = "/sys/kernel/security/lsm"
@@ -99,11 +181,6 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 		return err
 	}
 	observerID := hex.EncodeToString(instance[:])
-	output := consume
-	consume = func(e Event) error {
-		e.Observer = observerID
-		return output(e)
-	}
 	host, err := hostNetNS()
 	if err != nil {
 		return err
@@ -133,7 +210,7 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 			links[i].Close()
 		}
 	}()
-	for _, name := range []string{"wine_exec", "wine_file", "wine_create", "wine_connect", "wine_send"} {
+	for _, name := range []string{"wine_exec", "wine_file", "wine_file_free", "wine_create", "wine_connect", "wine_send"} {
 		l, err := link.AttachLSM(link.LSMOptions{Program: coll.Programs[name]})
 		if err != nil {
 			return fmt.Errorf("attach %s: %w", name, err)
@@ -171,7 +248,14 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 			<-beats
 		}()
 	}
-	if err := consume(Event{Type: "ready"}); err != nil {
+	sink := newEventSink(observerID, eventQueueSize, consume)
+	sinkClosed := false
+	defer func() {
+		if !sinkClosed {
+			_ = sink.close(stopFlushTimeout)
+		}
+	}()
+	if err := sink.emit(Event{Type: "ready"}); err != nil {
 		return err
 	}
 	pasta := newRelays(coll.Maps["pasta_targets"], coll.Maps["dns_forwards"])
@@ -182,12 +266,17 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 		if err := pollHeartbeat(beatDone); err != nil {
 			return err
 		}
+		if err := sink.err(); err != nil {
+			return err
+		}
 		if ctx.Err() != nil {
-			return consume(Event{Type: "stopped", Reason: "cancelled"})
+			_ = sink.emit(Event{Type: "stopped", Reason: "cancelled"})
+			sinkClosed = true
+			return sink.close(stopFlushTimeout)
 		}
 		if len(pasta.waiting) != 0 && time.Since(scanned) >= scanInterval {
 			scanned = time.Now()
-			if err := pasta.scan(scanned, consume); err != nil {
+			if err := pasta.scan(scanned, sink.emit); err != nil {
 				return err
 			}
 		}
@@ -195,11 +284,12 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 		if err := coll.Maps["counters"].Lookup(uint32(1), &losses); err != nil {
 			return err
 		}
-		if losses != reportedLosses {
-			if err := consume(Event{Type: "loss", LostEvents: losses - reportedLosses}); err != nil {
+		lost := (losses - reportedLosses) + sink.takeDropped()
+		if lost != 0 {
+			reportedLosses = losses
+			if err := sink.emit(Event{Type: "loss", LostEvents: lost}); err != nil {
 				return err
 			}
-			reportedLosses = losses
 		}
 		rd.SetDeadline(time.Now().Add(200 * time.Millisecond))
 		record, err := rd.Read()
@@ -213,15 +303,17 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 		if err != nil {
 			return fmt.Errorf("decode Wine observation: %w", err)
 		}
-		if err := consume(e); err != nil {
-			return err
-		}
+		// Register sandboxes before diagnostic output so pasta discovery is
+		// never delayed behind event formatting.
 		if e.Type == "server" && !options.NoRelay {
 			scanned = time.Now()
 			pasta.add(int(e.ServerTGID), e.NetNS, scanned)
-			if err := pasta.scan(scanned, consume); err != nil {
+			if err := pasta.scan(scanned, sink.emit); err != nil {
 				return err
 			}
+		}
+		if err := sink.emit(e); err != nil {
+			return err
 		}
 	}
 }

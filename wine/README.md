@@ -45,8 +45,12 @@ when `NOTIFY_SOCKET` is set. It refuses to start unless `bpf` appears in
 `/sys/kernel/security/lsm`, because its LSM hooks would otherwise attach without
 recording anything. Wine and games remain unprivileged.
 
-A wineserver which predates the observer is picked up at its next request, but
-sockets it already created stay unlabelled.
+A wineserver which predates the observer is picked up at its next request, and
+sockets it already created stay unlabelled. For a client thread whose request
+pipe existed before the observer started, the first request after startup only
+registers that pipe (a socket created during that first request is `no-client`);
+the client's next write on that pipe names the client for subsequent wineserver
+and client-created sockets.
 
 ## What the events mean
 
@@ -98,10 +102,10 @@ protocol:
    (`lsm/file_permission`). A pipe read for the first time names nobody until
    its client writes, so a socket created before then is `no-client`, not the
    client of an earlier request. The pipe's record also names the wineserver
-   that read it. Records outlive their pipes, and the kernel reuses a freed
-   pipe inode's memory, so a record is keyed by the inode's address and its
-   number, which is new for every pipe: a process writing to a later pipe at
-   the same address does not become a client.
+   that read it. Records are pruned from `request_pipes` once all ends of a pipe
+   close (`lsm/file_free_security`), and each entry is keyed by the inode's
+   address and its number, which is new for every pipe, so a process writing to
+   a later pipe at a reused inode address does not become a client.
 2. Each later read records the client being served. wineserver is single-threaded
    and handles a request within the read which fetched it, so the sockets which
    follow are that client's (`lsm/socket_post_create`).
@@ -127,8 +131,7 @@ resolver behind `getaddrinfo`, GStreamer, libldap. The same
 records, with the process's start time ruling out a reused ID, and labels them
 with that client's identity: status, image, encoding, Windows PID, client TGID
 and start time, and, in the fields which name a wineserver, the one that reads
-the client's requests. A client whose wineserver is not known, possible only
-when its pipe's record was evicted before its write, keeps its sockets
+the client's requests. A client whose wineserver is not known keeps its sockets
 unlabelled rather than name itself as its own server. Every socket creation by
 a process which is neither a wineserver nor a Wine client costs one map lookup
 by process ID, and nothing else.
@@ -152,8 +155,11 @@ was 37% in a benchmark doing nothing else.
 beside its ABI v1 maps. V1 records are unchanged, so no v1 version change applies.
 These have their own version, currently 2, and their pins come and go with the
 observer. Each pin appears under its final name with its final owner and mode.
-The heartbeat runs independently of the diagnostic output, so a blocked or closed
-stdout does not make live records stale. If its pins disappear, for example after
+The diagnostic event stream is delivered through a bounded queue that drops new
+diagnostics when stdout blocks, so a blocked stdout does not stall pasta
+discovery, the heartbeat, or shutdown unpinning. A closed stdout (`SIGPIPE` or
+`EPIPE`) stops the observer non-zero and removes its pins cleanly. If its pins
+disappear, for example after
 a `socketowner detach` from a loader that removed them, the observer publishes
 them again. On exit it removes only pins that are still its own.
 
@@ -398,8 +404,10 @@ child's, are asserted against the events and `wine_flows`.
   which is not a Wine client; a forked child of a client which never wrote a
   request of its own has its own process ID and stays unlabelled; a socket
   created before the client's first request names nobody, because no client
-  record exists yet; and a client whose pipe record was evicted, a bounded-map
-  corner, keeps its own sockets unlabelled while wineserver's for it still work.
+  record exists yet; and if a live pipe's record is evicted under extreme
+  pressure (65,536 open request pipes at once; closed pipes are pruned), its
+  next request registers the pipe afresh, leaving any socket created during that
+  request `no-client` until the client writes again.
 - **DNS.** A query through pasta's `--dns-forward` address joins its client
   only when pasta is started with `--dns-host`: the observer learns the
   translation from the command line alone, and pasta's default host

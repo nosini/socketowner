@@ -42,10 +42,10 @@ func TestEmbeddedObjectLayout(t *testing.T) {
 	if binary.Size(rawEvent{}) != 1152 || binary.Size(rawOwner{}) != 1088 {
 		t.Fatal("unexpected userspace structure layout")
 	}
-	if len(spec.Programs) != 6 {
+	if len(spec.Programs) != 7 {
 		t.Fatalf("unexpected programs: %v", spec.Programs)
 	}
-	for _, name := range []string{"wine_file", "wine_create", "wine_connect", "wine_send", "wine_exec"} {
+	for _, name := range []string{"wine_file", "wine_file_free", "wine_create", "wine_connect", "wine_send", "wine_exec"} {
 		if spec.Programs[name].Type != ebpf.LSM {
 			t.Fatal(name)
 		}

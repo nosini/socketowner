@@ -1,6 +1,7 @@
 package wine
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -125,5 +126,120 @@ func TestHeartbeatNotBlockedByWriter(t *testing.T) {
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLockDirSerializesCallers(t *testing.T) {
+	dir := t.TempDir()
+	first, err := lockDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		second, err := lockDir(dir)
+		if err != nil {
+			done <- err
+			return
+		}
+		close(acquired)
+		unlockDir(second)
+		done <- nil
+	}()
+	select {
+	case <-acquired:
+		unlockDir(first)
+		t.Fatal("second caller acquired directory lock while first held it")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlockDir(first)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second caller did not acquire lock after release")
+	}
+}
+
+func newTestCollection(t *testing.T) *ebpf.Collection {
+	t.Helper()
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		t.Skip("needs BPF privileges:", err)
+	}
+	t.Cleanup(func() { coll.Close() })
+	return coll
+}
+
+// A stalled publisher whose heartbeat expired must neither overwrite nor delete
+// a live successor's pins when it resumes ensurePins() and close().
+func TestStalledPublisherDoesNotClobberSuccessor(t *testing.T) {
+	dir := pinDir(t)
+	collA := newTestCollection(t)
+	collB := newTestCollection(t)
+
+	pubA, err := publish(collA, dir, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Make A's heartbeat stale, as if A stalled past heartbeatLimit.
+	now, err := bootTime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := uint64(1)
+	if now > uint64(2*heartbeatLimit) {
+		stale = now - uint64(2*heartbeatLimit)
+	}
+	if err := pubA.heartbeat.Update(uint32(0), stale, ebpf.UpdateAny); err != nil {
+		t.Fatal(err)
+	}
+
+	// Successor B claims and publishes while A is stalled.
+	pubB, err := publish(collB, dir, -1)
+	if err != nil {
+		t.Fatalf("successor publish failed: %v", err)
+	}
+	defer pubB.close()
+
+	pinNames := []string{abiPin, heartbeatPin, peerFlowsPin, flowsPin}
+	wantIDs := make(map[string]pinID, len(pinNames))
+	for _, name := range pinNames {
+		id, err := pinIDOf(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("successor pin %s missing: %v", name, err)
+		}
+		wantIDs[name] = id
+	}
+
+	// A resumes: ensurePins must fail and leave every one of B's pins untouched.
+	if err := pubA.ensurePins(); err == nil {
+		t.Fatal("stalled publisher's ensurePins succeeded after successor takeover")
+	}
+	for _, name := range pinNames {
+		got, err := pinIDOf(filepath.Join(dir, name))
+		if err != nil || got != wantIDs[name] {
+			t.Fatalf("pin %s changed after stalled ensurePins: got %+v (%v), want %+v", name, got, err, wantIDs[name])
+		}
+	}
+
+	// A closes: must not delete any of B's pins or zero B's heartbeat.
+	pubA.close()
+	for _, name := range pinNames {
+		got, err := pinIDOf(filepath.Join(dir, name))
+		if err != nil || got != wantIDs[name] {
+			t.Fatalf("pin %s changed after stalled close: got %+v (%v), want %+v", name, got, err, wantIDs[name])
+		}
+	}
+	var beat uint64
+	if err := pubB.heartbeat.Lookup(uint32(0), &beat); err != nil || beat == 0 {
+		t.Fatalf("successor heartbeat corrupted: %d (%v)", beat, err)
 	}
 }
