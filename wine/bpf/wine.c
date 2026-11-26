@@ -115,7 +115,9 @@ struct storage {
 	// Creator of this socket: CREATED_SERVER or CREATED_CLIENT. A pasta
 	// socket has none, so relay events leave the field empty.
 	__u32 sends, creator;
-	// Used only in relay_flows, whose values are copies of this record.
+	// Used only in relay_flows, whose values are copies of this record. A
+	// TCP record is stamped in its source before the copy, so it is never
+	// visible without them.
 	__u64 seen_ns;
 	__u32 count, ambiguous;
 };
@@ -258,8 +260,9 @@ struct {
 	__type(key, struct forward_key);
 	__type(value, struct dns_forward);
 } dns_forwards SEC(".maps");
-// An all-zero record: the update helper needs its value in map or stack memory,
-// and this one is too large for the stack.
+// A record with no owner: the update helper needs its value in map or stack
+// memory, and this one is too large for the stack. Only the relay fields are
+// ever written, each CPU writing the same count and a recent time.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -650,7 +653,10 @@ static __always_inline void relay_connect(struct task_struct *task, struct pasta
 		k.source_port = sk->__sk_common.skc_num;
 	e = bpf_map_lookup_elem(&relay_flows, &k);
 	if (e) {
-		fresh = protocol == 17 || bpf_ktime_get_boot_ns() - e->seen_ns <= RELAY_TTL_NS;
+		__u64 now = bpf_ktime_get_boot_ns(), seen = e->seen_ns;
+		// A SYN recorded since the clock was read leaves seen later than
+		// now: the record is fresh, not expired by the difference wrapping.
+		fresh = protocol == 17 || now <= seen || now - seen <= RELAY_TTL_NS;
 		if (!fresh)
 			status = NO_INNER_FLOW;
 		else if (e->ambiguous)
@@ -846,21 +852,30 @@ static __always_inline void note_inner_flow(struct flow *f, struct storage *s)
 	if ((f->tcp_flags & 0x12) != 0x02)
 		return;
 	p = bpf_map_lookup_elem(&relay_flows, &k);
-	if (p && now - p->seen_ns > RELAY_TTL_NS) {
+	// Another CPU can stamp the record after this one read the clock; such a
+	// record is fresh, not expired by the difference wrapping around.
+	if (p && now > p->seen_ns && now - p->seen_ns > RELAY_TTL_NS) {
 		bpf_map_delete_elem(&relay_flows, &k);
 		p = 0;
 	}
 	if (!p) {
+		// Publish the record with its time and count already set. Stamped
+		// after the insert, it was visible for a moment as stale with no
+		// SYN: another CPU's SYN to the destination then replaced it, or
+		// pasta's connect deleted it as expired, and this flow took that
+		// SYN's owner or none. The fields are the source's own, not its
+		// owner's, and any concurrent writer stores the same count and a
+		// recent time.
+		value->seen_ns = now;
+		value->count = 1;
+		value->ambiguous = 0;
 		// NOEXIST keeps two CPUs from replacing each other's waiting record.
-		int inserted = !bpf_map_update_elem(&relay_flows, &k, value, BPF_NOEXIST);
+		if (!bpf_map_update_elem(&relay_flows, &k, value, BPF_NOEXIST))
+			return;
+		// Another CPU's record came first: join it.
 		p = bpf_map_lookup_elem(&relay_flows, &k);
 		if (!p)
 			return;
-		if (inserted) {
-			p->seen_ns = now;
-			__sync_fetch_and_add(&p->count, 1);
-			return;
-		}
 	}
 	if (!same_owner(p, s))
 		p->ambiguous = 1;

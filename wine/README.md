@@ -404,15 +404,19 @@ child's, are asserted against the events and `wine_flows`.
   wrong. No path is available.
 - **UDP reuse.** A new inner socket reusing a live UDP 4-tuple inherits pasta's
   existing flow, and with it the previous owner until that flow expires.
-- **TCP join race, which can misname a flow.** pasta's connect can delete a
-  destination's TCP record while another CPU is recording the next SYN on it.
-  That SYN's update is lost: its flow finds no record and is `wine-unknown`, or,
-  if a SYN from the record's earlier program creates a new record first, it is
-  named after that program. Under load with several programs sharing one
-  destination, 5 of 44,800 TCP flows were named after the wrong program; with
-  separate destinations, 4 of 48,000 were unknown and none was misnamed.
-  Do not rely on a deny rule for a program whose sandbox runs other programs
-  connecting to the same destinations at the same time.
+- **TCP record deletion races, which can misname a flow.** A TCP record is
+  deleted by its key: by pasta's connect when its last waiting flow joins, and
+  by a SYN that finds it expired. Another CPU recording a SYN on the record at
+  that moment loses its update: its flow finds no record and is `wine-unknown`,
+  or, if a SYN from another program creates a new record first, it is named
+  after that program. Two SYNs that find the same expired record can also both
+  delete it, the second removing the record the first has just created. Under
+  load with several programs sharing one destination, up to 5 of 44,800 TCP
+  flows (2 of 25,600 in a later run) were named after the wrong program, and
+  most of the rest were ambiguous and `wine-unknown`; with separate
+  destinations a few flows in tens of thousands were unknown and none was
+  misnamed. Do not rely on a deny rule for a program whose sandbox runs other
+  programs connecting to the same destinations at the same time.
 - **Shared source ports.** Linux lets sockets with different peers share a local
   address and port. When an unlabelled socket sends from the address and port of
   a live pasta socket, it removes that socket's `wine_flows` record by design.
