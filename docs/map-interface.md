@@ -201,14 +201,13 @@ than 1024 bytes or more than 32 levels deep is recorded with length
 `-ENAMETOOLONG` (-36); ignore the path bytes then. As with executable paths, use
 the length and never scan for the NUL.
 
-The LSM socket hooks save the path of the socket user's cgroup on every connect,
-and on a send when the socket's recorded cgroup has changed since the path was
-last saved, unless the ID is already in the map. An entry is never rewritten, so
-it describes the cgroup when it was first seen; a cgroup renamed later keeps its
-old path. Entries outlive the cgroup and are evicted by LRU. A cgroup whose
-sockets have only sent since the loader attached, without connecting, may have
-lost its entry to eviction until the socket's cgroup changes; treat a missing
-entry as unknown.
+The LSM socket hooks check `cgroup_paths` on every connect and send, saving the
+path of the socket user's cgroup whenever its ID is missing from the map. An
+entry is never rewritten, so it describes the cgroup when it was first seen; a
+cgroup renamed later keeps its old path. Entries outlive the cgroup and are
+evicted by LRU; looking up the map on every send keeps active cgroups recently
+used and repopulates an evicted entry on the next send or connect. Treat a
+missing entry as unknown.
 
 cgroups are attribution, not authentication. A process can create cgroups in
 any subtree delegated to it, such as its systemd user manager's, give them any
@@ -246,14 +245,18 @@ A record belongs to an owner only if `start_ns <= owner.boot_ns` and either
 `exit_ns == 0` or `exit_ns >= owner.boot_ns`. Check task storage first and then
 history. This narrows, but does not remove, PID reuse. `exit_ns` is when the task
 was freed, after it was reaped, so a process that reuses the ID in between can
-match the old record; when the old task is finally freed, that hook can
-overwrite the new process's `exec_recent` entry with the old record and a later
-`exit_ns`. A socket's owner record also keeps the timestamp and UID it first
+match the old record; the task-free hook stamps `exit_ns` before updating
+`exec_recent` and skips the update when an entry with a later `start_ns` is
+already present, though a concurrent update by a newly reused PID can still race
+with it. A socket's owner record also keeps the timestamp and UID it first
 recorded for a TGID: a socket that outlives its owner and is then used by a new
 process with that ID keeps the old `boot_ns`, so the old record still matches.
-The UID is the owner's at `boot_ns`, not after a later setuid. A fork that fails
-after its ID is allocated may still run the task-free hook, leaving an entry for
-a process that never ran.
+The UID is the owner's at `boot_ns`, not after a later setuid. Calling `execve`
+after sending on a socket keeps the same TGID and `start_ns` while overwriting
+`exec_tasks` and `exec_recent` with the new program, so a pre-exec flow still
+being resolved is attributed to the post-exec binary, matching `/proc/<pid>/exe`.
+A fork that fails after its ID is allocated may still run the task-free hook,
+leaving an entry for a process that never ran.
 
 Scripts name the interpreter, like `/proc/<pid>/exe`. A path can end in
 ` (deleted)` when the executable has been unlinked; seeded records of such

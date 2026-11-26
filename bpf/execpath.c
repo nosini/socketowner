@@ -15,11 +15,11 @@
 //
 // A process that has been reaped can't be looked up by pidfd any more, but
 // its record only reaches exec_recent once the task is freed, which can be
-// much later. So when a process first sends on or connects a socket, its
-// record is saved in exec_recent too, and the owner of a connection can still
-// be named right after it exits. These hooks also record the process that
-// sends on a connected socket as its owner, which the cgroup hooks in
-// sockowner.c don't see.
+// much later. So when a process connects or sends on a socket, its record is
+// kept in exec_recent (repopulating evicted entries), and the owner of a
+// connection can still be named right after it exits. These hooks also record
+// the process that sends on a connected socket as its owner, which the cgroup
+// hooks in sockowner.c don't see.
 //
 // Every record carries the process's start time. A record only belongs to a
 // connection's owner if the process started before the owner was recorded and,
@@ -34,11 +34,11 @@
 // seed_tasks is an iterator the loader runs once after attaching, to add the
 // processes that were already running.
 //
-// The socket hooks also save the path of the socket user's cgroup v2 in
-// cgroup_paths, keyed by cgroup ID, the first time they see that cgroup on a
-// socket, so that mihomo can name the cgroup sockowner.c publishes for a
-// connection without reading cgroupfs. IDs aren't reused, so an entry stays
-// right after the cgroup is removed.
+// The socket hooks also keep the path of the socket user's cgroup v2 in
+// cgroup_paths, keyed by cgroup ID, looking it up on every connect or send and
+// repopulating it if evicted, so that mihomo can name the cgroup sockowner.c
+// publishes for a connection without reading cgroupfs. IDs aren't reused, so
+// an entry stays right after the cgroup is removed.
 //
 // Unlike sockowner.c, these programs read kernel structures (relocated with
 // BTF) and call bpf_d_path, so loading them needs CAP_PERFMON in addition to
@@ -345,16 +345,18 @@ SEC("lsm/task_free")
 int BPF_PROG(record_free, struct task_struct *task)
 {
 	__u32 tgid = task->tgid;
-	struct exec_path *e;
+	struct exec_path *e, *existing;
 
 	if (task->group_leader != task || !tgid)
 		return 0;
 	e = bpf_task_storage_get(&exec_tasks, task, 0, 0);
-	if (!e || bpf_map_update_elem(&exec_recent, &tgid, e, BPF_ANY))
+	if (!e)
 		return 0;
-	e = bpf_map_lookup_elem(&exec_recent, &tgid);
-	if (e)
-		e->exit_ns = bpf_ktime_get_boot_ns();
+	existing = bpf_map_lookup_elem(&exec_recent, &tgid);
+	if (existing && existing->start_ns > e->start_ns)
+		return 0;
+	e->exit_ns = bpf_ktime_get_boot_ns();
+	bpf_map_update_elem(&exec_recent, &tgid, e, BPF_ANY);
 	return 0;
 }
 
@@ -443,13 +445,16 @@ static __always_inline __u64 save_cgroup_path(struct task_struct *task)
 }
 
 // Records the current process as the owner of a TCP or UDP socket it uses,
-// and saves its record in exec_recent the first time it does. Saves the path
-// of its cgroup on a connect, and on a send when the socket's cgroup changed.
-static __always_inline void record_socket_user(struct socket *sock, int connect)
+// keeps its cgroup path in cgroup_paths, and keeps its executable record in
+// exec_recent. Looking up both LRU maps on every call keeps active entries
+// recently used and repopulates entries that were evicted.
+static __always_inline void record_socket_user(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
+	struct task_struct *task, *leader;
 	struct sock_owner *so;
-	struct exec_path *e;
+	struct exec_path *e, *recent;
+	__u64 cgid;
 	__u32 tgid;
 
 	if (!sk ||
@@ -461,21 +466,18 @@ static __always_inline void record_socket_user(struct socket *sock, int connect)
 				BPF_SK_STORAGE_GET_F_CREATE);
 	if (!so)
 		return;
-	record_current(so);
-	if (connect || so->named_cgroup != so->cgroup_id) {
-		__u64 id = save_cgroup_path(bpf_get_current_task_btf());
-
-		// The task can move between reading its cgroup ID and its
-		// path; only a path saved for the recorded ID counts.
-		so->named_cgroup = id == so->cgroup_id ? id : 0;
-	}
-	tgid = so->owner.tgid;
-	if (so->saved_tgid == tgid)
+	cgid = record_current(so);
+	task = bpf_get_current_task_btf();
+	if (cgid && !bpf_map_lookup_elem(&cgroup_paths, &cgid))
+		save_cgroup_path(task);
+	tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+	leader = task->group_leader;
+	e = bpf_task_storage_get(&exec_tasks, leader, 0, 0);
+	if (!e)
 		return;
-	e = bpf_task_storage_get(&exec_tasks,
-				 bpf_get_current_task_btf()->group_leader, 0, 0);
-	if (e && !bpf_map_update_elem(&exec_recent, &tgid, e, BPF_ANY))
-		so->saved_tgid = tgid;
+	recent = bpf_map_lookup_elem(&exec_recent, &tgid);
+	if (!recent || recent->start_ns != e->start_ns || recent->exit_ns != 0)
+		bpf_map_update_elem(&exec_recent, &tgid, e, BPF_ANY);
 }
 
 // Runs in the sending process for every send, write or splice on a socket,
@@ -487,7 +489,7 @@ int BPF_PROG(record_send, struct socket *sock, struct msghdr *msg, int size,
 {
 	if (ret)
 		return ret;
-	record_socket_user(sock, 0);
+	record_socket_user(sock);
 	return 0;
 }
 
@@ -498,7 +500,7 @@ int BPF_PROG(record_connect, struct socket *sock, struct sockaddr *address,
 {
 	if (ret)
 		return ret;
-	record_socket_user(sock, 1);
+	record_socket_user(sock);
 	return 0;
 }
 

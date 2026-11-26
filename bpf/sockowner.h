@@ -27,15 +27,12 @@ struct conn_cgroup {
 };
 
 struct sock_owner {
+	struct bpf_spin_lock lock;
+	__u32 pad;
 	struct conn_owner owner;
 	__u64 netns;
-	// The owner whose executable execpath.c saved in exec_recent last.
-	__u32 saved_tgid;
-	__u32 pad;
 	// The cgroup v2 of the process that last recorded itself as the owner.
 	__u64 cgroup_id;
-	// The cgroup whose path execpath.c saved in cgroup_paths last.
-	__u64 named_cgroup;
 };
 
 struct {
@@ -50,18 +47,26 @@ static __always_inline int tracked_protocol(__u32 protocol)
 	return protocol == IPPROTO_TCP || protocol == IPPROTO_UDP;
 }
 
-// Records the current process as the owner. Keeps the time of an owner that
-// is recorded again, which must stay before the process exits for mihomo to
-// accept it. The cgroup is taken every time, since a process can move to
-// another cgroup, as flatpak run does when it starts the app's scope.
-static __always_inline void record_current(struct sock_owner *so)
+// Records the current process as the owner and returns its cgroup v2 ID.
+// Keeps the time of an owner that is recorded again, which must stay before
+// the process exits for mihomo to accept it. The cgroup is taken every time,
+// since a process can move to another cgroup, as flatpak run does when it
+// starts the app's scope. The lock keeps owner and cgroup_id consistent when
+// processes share a socket.
+static __always_inline __u64 record_current(struct sock_owner *so)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u32 uid = (__u32)bpf_get_current_uid_gid();
+	__u64 boot_ns = bpf_ktime_get_boot_ns();
+	__u64 cgroup_id = bpf_get_current_cgroup_id();
 
-	so->cgroup_id = bpf_get_current_cgroup_id();
-	if (so->owner.tgid == tgid && so->owner.boot_ns)
-		return;
-	so->owner.tgid = tgid;
-	so->owner.uid = (__u32)bpf_get_current_uid_gid();
-	so->owner.boot_ns = bpf_ktime_get_boot_ns();
+	bpf_spin_lock(&so->lock);
+	so->cgroup_id = cgroup_id;
+	if (so->owner.tgid != tgid || !so->owner.boot_ns) {
+		so->owner.tgid = tgid;
+		so->owner.uid = uid;
+		so->owner.boot_ns = boot_ns;
+	}
+	bpf_spin_unlock(&so->lock);
+	return cgroup_id;
 }

@@ -71,6 +71,10 @@ var execMapNames = []string{"exec_tasks", "exec_recent", cgroupPathsMap}
 // The maps the loader publishes in the shared maps directory.
 var loaderMapNames = append([]string{mapName, cgroupMapName, flowMapName, abiVersionMap}, execMapNames...)
 
+// Cgroup programs in attach order: record socket owners before egress starts
+// publishing them.
+var cgroupPrograms = []string{"sock_create", "connect4", "connect6", "sendmsg4", "sendmsg6", "egress"}
+
 // The LSM programs in the exec-path object; seed_tasks is run, not attached.
 var execPrograms = []string{"record_exec", "record_fork", "record_free", "record_send", "record_connect"}
 
@@ -198,7 +202,19 @@ func attach(cgroup, pin string, execPaths bool, gid int) error {
 		return err
 	}
 
-	for name, prog := range coll.Programs {
+	if execColl != nil {
+		if err := attachExec(execColl, links, maps, gid); err != nil {
+			detach(pin)
+			return err
+		}
+	}
+
+	for _, name := range cgroupPrograms {
+		prog := coll.Programs[name]
+		if prog == nil {
+			detach(pin)
+			return fmt.Errorf("missing program %s", name)
+		}
 		l, err := link.AttachCgroup(link.CgroupOptions{
 			Path:    cgroup,
 			Attach:  spec.Programs[name].AttachType,
@@ -213,13 +229,6 @@ func attach(cgroup, pin string, execPaths bool, gid int) error {
 		if err != nil {
 			detach(pin)
 			return fmt.Errorf("pin %s: %w", name, err)
-		}
-	}
-
-	if execColl != nil {
-		if err := attachExec(execColl, links, maps, gid); err != nil {
-			detach(pin)
-			return err
 		}
 	}
 

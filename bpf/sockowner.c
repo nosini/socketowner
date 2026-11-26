@@ -273,6 +273,16 @@ int egress(struct __sk_buff *skb)
 	key.port = fkey.sport;
 	key.proto = fkey.proto;
 
+	// Snapshot owner and cgroup together so concurrent sends on a shared
+	// socket cannot publish a torn pair across the three maps.
+	struct conn_owner owner;
+	__u64 cgroup_id;
+
+	bpf_spin_lock(&so->lock);
+	owner = so->owner;
+	cgroup_id = so->cgroup_id;
+	bpf_spin_unlock(&so->lock);
+
 	// Check the maps on every packet rather than remembering what this
 	// socket published: the source address and port can change (a UDP
 	// socket that disconnects is bound again on its next send), and the
@@ -280,22 +290,22 @@ int egress(struct __sk_buff *skb)
 	// keep the entries of an active flow recently used.
 	struct conn_owner *published = bpf_map_lookup_elem(&conn_owners, &key);
 	if (!published ||
-	    __builtin_memcmp(published, &so->owner, sizeof(so->owner)))
-		bpf_map_update_elem(&conn_owners, &key, &so->owner, BPF_ANY);
+	    __builtin_memcmp(published, &owner, sizeof(owner)))
+		bpf_map_update_elem(&conn_owners, &key, &owner, BPF_ANY);
 
 	// An unowned socket publishes an empty record here too, so a stale
 	// cgroup is never taken for its own.
 	struct conn_cgroup cg = {
-		.tgid = so->owner.tgid,
-		.boot_ns = so->owner.boot_ns,
-		.cgroup_id = so->owner.tgid ? so->cgroup_id : 0,
+		.tgid = owner.tgid,
+		.boot_ns = owner.boot_ns,
+		.cgroup_id = owner.tgid ? cgroup_id : 0,
 	};
 	struct conn_cgroup *cg_published = bpf_map_lookup_elem(&conn_cgroups, &key);
 	if (!cg_published || __builtin_memcmp(cg_published, &cg, sizeof(cg)))
 		bpf_map_update_elem(&conn_cgroups, &key, &cg, BPF_ANY);
 
 	struct conn_flow flow = {
-		.owner = so->owner,
+		.owner = owner,
 		.cgroup_id = cg.cgroup_id,
 	};
 	struct conn_flow *flow_published = bpf_map_lookup_elem(&conn_flows, &fkey);

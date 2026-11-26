@@ -216,6 +216,20 @@ func TestCgroupConnectedSendWithExecPaths(t *testing.T) {
 	}
 	checkPath(cg.CgroupID, "/"+rel)
 
+	// Evicting the cgroup from cgroup_paths must be repaired on the next send
+	// on the same connected socket, without reconnecting or changing cgroup.
+	if err := paths.Delete(cg.CgroupID); err != nil {
+		t.Fatalf("delete cgroup_paths[%d]: %v", cg.CgroupID, err)
+	}
+	var gone cgroupPathValue
+	if err := paths.Lookup(cg.CgroupID, &gone); err == nil {
+		t.Fatal("cgroup_paths entry still present after delete")
+	}
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	checkPath(cg.CgroupID, "/"+rel)
+
 	// A cgroup deeper than the limit is recorded as too long.
 	deep := inner
 	for i := 0; i < 33; i++ {

@@ -65,9 +65,25 @@ func TestObjects(t *testing.T) {
 			if len(spec.Programs) != len(want) {
 				t.Fatalf("%d programs", len(spec.Programs))
 			}
+			if len(cgroupPrograms) != len(want) || cgroupPrograms[len(cgroupPrograms)-1] != "egress" {
+				t.Fatalf("cgroupPrograms = %v, want %d programs ending with egress", cgroupPrograms, len(want))
+			}
+			seen := make(map[string]bool, len(cgroupPrograms))
+			for _, name := range cgroupPrograms {
+				if seen[name] {
+					t.Errorf("duplicate program %s in cgroupPrograms", name)
+				}
+				seen[name] = true
+				if _, ok := want[name]; !ok {
+					t.Errorf("unexpected program %s in cgroupPrograms", name)
+				}
+			}
 			for name, attach := range want {
 				if p := spec.Programs[name]; p == nil || p.AttachType != attach {
 					t.Errorf("program %s: %+v", name, p)
+				}
+				if !seen[name] {
+					t.Errorf("program %s missing from cgroupPrograms", name)
 				}
 			}
 			m := spec.Maps[mapName]
