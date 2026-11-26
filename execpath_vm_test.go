@@ -215,6 +215,30 @@ func TestRecordFreeDoesNotOverwriteNewerPID(t *testing.T) {
 		t.Fatal(err)
 	}
 	recent := loadPinned(t, pin, "exec_recent")
+
+	// Positive control: a short-lived child's own entry must get a non-zero
+	// exit_ns from record_free, so the assertion below cannot pass merely
+	// because record_free never ran in this environment.
+	control := exec.Command("/bin/true")
+	if err := control.Start(); err != nil {
+		t.Fatal(err)
+	}
+	controlPid := uint32(control.Process.Pid)
+	if err := control.Wait(); err != nil {
+		t.Fatalf("control child: %v", err)
+	}
+	controlDeadline := time.Now().Add(2 * time.Second)
+	for {
+		var controlRec execRecord
+		if err := recent.Lookup(controlPid, &controlRec); err == nil && controlRec.ExitNS != 0 {
+			break
+		}
+		if time.Now().After(controlDeadline) {
+			t.Fatalf("record_free never stamped exit_ns on the control child %d", controlPid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	cmd := exec.Command("/bin/sleep", "60")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

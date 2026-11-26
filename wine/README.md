@@ -38,7 +38,9 @@ Pins are removed on exit; a crash leaves them until the next publisher.
 The observer needs host BPF/LSM and cgroup attachment privileges, and permission
 to inspect other processes' file descriptors to find pasta, so `CAP_SYS_PTRACE`
 and `CAP_DAC_READ_SEARCH` to list other users' `/proc/<pid>/fd` directories, in
-addition to `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`. The optional service and SELinux policy live in
+addition to `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`, plus `CAP_CHOWN`,
+which `-reader-group` needs to hand the pinned maps and their directory to that
+group. The optional service and SELinux policy live in
 [hardened-proxy-service](https://github.com/nosini/hardened-proxy-service), not in
 this repository. The command sends systemd readiness after publishing its maps
 when `NOTIFY_SOCKET` is set. It refuses to start unless `bpf` appears in
@@ -103,7 +105,8 @@ protocol:
    its client writes, so a socket created before then is `no-client`, not the
    client of an earlier request. The pipe's record also names the wineserver
    that read it. Records are pruned from `request_pipes` once all ends of a pipe
-   close (`lsm/file_free_security`), and each entry is keyed by the inode's
+   close (on return from `pipe_release`, while the file still holds the pipe's
+   inode), and each entry is keyed by the inode's
    address and its number, which is new for every pipe, so a process writing to
    a later pipe at a reused inode address does not become a client.
 2. Each later read records the client being served. wineserver is single-threaded
@@ -116,6 +119,12 @@ protocol:
    client stays `no-image` and is retried on its next request (and with a
    sleepable fault-in read when the client opens a socket itself, in case its
    PEB or image page was swapped out); it does not fall back to a mapped name.
+   That sleepable fault-in runs only when the program's own Linux process
+   creates a socket (`lsm.s/socket_post_create`): a program that uses only
+   Winsock has every socket created by wineserver, so it is named from the
+   non-sleepable request hook, which cannot fault pages in. When its PEB,
+   ProcessParameters or ImagePathName page is swapped out at that moment, the
+   image stays unknown until a later request finds the page resident again.
 4. Under old-style WOW64, the default of a Wine with 32-bit Unix libraries,
    32-bit programs run as true 32-bit Linux processes, so GS is glibc's TLS and that check fails.
    Encoding 1 is used only for such a client: the first mapping by address
@@ -415,6 +424,13 @@ child's, are asserted against the events and `wine_flows`.
   pressure (65,536 open request pipes at once; closed pipes are pruned), its
   next request registers the pipe afresh, leaving any socket created during that
   request `no-client` until the client writes again.
+- **Swapped-out pages at a Winsock-only request.** The sleepable retry that
+  faults a client's PEB, ProcessParameters or ImagePathName page back in runs
+  only when the program's own Linux process creates a socket
+  (`lsm.s/socket_post_create`). A program that uses only Winsock has every
+  socket created by wineserver, so it is named from the non-sleepable request
+  hook: a page swapped out at that moment cannot be faulted in, and its flows
+  stay `wine-unknown` until a later request finds the page resident again.
 - **DNS.** A query through pasta's `--dns-forward` address joins its client
   only when pasta is started with `--dns-host` for that family: the observer
   learns the translation from the command line alone, and pasta's default host

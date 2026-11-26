@@ -25,8 +25,9 @@ On Linux, mihomo can look up the process behind a connection in BPF maps instead
   processes keep their record in task storage, `exec_tasks`; `exec_recent` keeps the latest
   records by process ID, including those of processes that have exited. A process's record goes
   there at exec and when it's freed, which can be well after it was reaped and can no longer be
-  found by process ID, so LSM hooks on `socket_connect` and `socket_sendmsg` also save it the
-  first time the process uses a socket. Each record has the process's start and task-free times,
+  found by process ID, so LSM hooks on `socket_connect` and `socket_sendmsg` also save it on
+  every connect and send, keeping the entry present and repopulating one that was evicted. Each
+  record has the process's start and task-free times,
   so most reused process IDs are rejected; the exact limits are in
   [map interface v1](map-interface.md). An iterator adds the processes that were already
   running. Only LSM hooks record, because the kernel skips a tracing program on a CPU where the

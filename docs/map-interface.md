@@ -57,7 +57,7 @@ would open for the recorded number. That pidfd either names an unrelated local
 process, whose record passes the ownership interval below if it started before
 the owner was recorded, or cannot be opened because no local process has that
 number. `exec_recent` is keyed by the recorded host TGID and needs no local
-process: it can name a process that executed, first used a tracked socket, or
+process: it can name a process that executed, used a tracked socket, or
 was freed after the loader attached. A process that has done none of these since
 the loader attached, such as one already running at attach, is only in
 `exec_tasks`.
@@ -229,10 +229,11 @@ Both executable maps use the same 1048-byte value:
 
 `exec_tasks` is keyed by an int32 pidfd opened by the reader for the recorded
 TGID. `exec_recent` is keyed by uint32 TGID and retains the most recent record,
-including processes that have exited. Its entries are published at exec, first
-socket use by an owner, and task-free; the latter can occur after reaping. Forked
-processes inherit the parent's executable. An iterator seeds existing processes
-when the loader attaches, into `exec_tasks` only.
+including processes that have exited. Its entries are published at exec and at
+task-free, which can occur after reaping; every connect and send looks the
+entry up and repopulates it, so an evicted entry returns on the next such call.
+Forked processes inherit the parent's executable. An iterator seeds existing
+processes when the loader attaches, into `exec_tasks` only.
 
 Use `Len` and never scan for the NUL. On success `bpf_d_path` returns the length
 including the NUL, which is 2 through 1024 here; the loader never writes 0 or 1,
