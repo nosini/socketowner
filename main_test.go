@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
@@ -285,6 +288,56 @@ func TestLookupGroupNumeric(t *testing.T) {
 	if _, err := lookupGroup("socketowner-no-such-group"); err == nil {
 		t.Fatal("accepted a missing group name")
 	}
+}
+
+func TestSeedWithRetries(t *testing.T) {
+	t.Run("no busy", func(t *testing.T) {
+		calls := 0
+		var sleeps []time.Duration
+		err := seedWithRetries(seedMaxAttempts, func() (uint64, error) {
+			calls++
+			return 0, nil
+		}, func(d time.Duration) { sleeps = append(sleeps, d) })
+		if err != nil || calls != 1 || len(sleeps) != 0 {
+			t.Fatalf("calls %d, sleeps %v, err %v", calls, sleeps, err)
+		}
+	})
+	t.Run("transient busy", func(t *testing.T) {
+		busy := []uint64{3, 1, 0}
+		calls := 0
+		var sleeps []time.Duration
+		err := seedWithRetries(seedMaxAttempts, func() (uint64, error) {
+			calls++
+			return busy[calls-1], nil
+		}, func(d time.Duration) { sleeps = append(sleeps, d) })
+		want := []time.Duration{seedRetryDelay, 2 * seedRetryDelay}
+		if err != nil || calls != 3 || !slices.Equal(sleeps, want) {
+			t.Fatalf("calls %d, sleeps %v, err %v; want 3 calls and %v", calls, sleeps, err, want)
+		}
+	})
+	t.Run("persistent busy", func(t *testing.T) {
+		calls := 0
+		var sleeps []time.Duration
+		err := seedWithRetries(seedMaxAttempts, func() (uint64, error) {
+			calls++
+			return 2, nil
+		}, func(d time.Duration) { sleeps = append(sleeps, d) })
+		if err != nil || calls != seedMaxAttempts || len(sleeps) != seedMaxAttempts-1 {
+			t.Fatalf("calls %d, sleeps %v, err %v", calls, sleeps, err)
+		}
+	})
+	t.Run("error", func(t *testing.T) {
+		failure := errors.New("read failed")
+		calls := 0
+		var sleeps []time.Duration
+		err := seedWithRetries(seedMaxAttempts, func() (uint64, error) {
+			calls++
+			return 0, failure
+		}, func(d time.Duration) { sleeps = append(sleeps, d) })
+		if !errors.Is(err, failure) || calls != 1 || len(sleeps) != 0 {
+			t.Fatalf("calls %d, sleeps %v, err %v", calls, sleeps, err)
+		}
+	})
 }
 
 func TestCheckBPFLSM(t *testing.T) {

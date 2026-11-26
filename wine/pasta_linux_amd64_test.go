@@ -6,7 +6,9 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -64,7 +66,7 @@ func (f *fakeFds) leaked() []int {
 }
 
 // testRelays returns relays over fake pidfds, which the test closes at its end.
-func testRelays(t *testing.T, fds *fakeFds, find func(int) (int, int, error)) *relays {
+func testRelays(t *testing.T, fds *fakeFds, find func(int) ([]pastaProc, error)) *relays {
 	t.Helper()
 	r := &relays{
 		waiting:    map[int]*waitingServer{},
@@ -91,7 +93,7 @@ func testRelays(t *testing.T, fds *fakeFds, find func(int) (int, int, error)) *r
 func TestScanBacksOffWithoutPasta(t *testing.T) {
 	finds := 0
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(int) (int, int, error) { finds++; return 0, -1, nil })
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) { finds++; return nil, nil })
 	start := time.Now()
 	r.add(10, 7, start)
 	var due []time.Duration
@@ -124,9 +126,9 @@ func TestScanRetriesExitedPasta(t *testing.T) {
 	gone := true
 	var events []Event
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(int) (int, int, error) {
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
 		pidfd, err := fds.open(20)
-		return 20, pidfd, err
+		return []pastaProc{{pid: 20, pidfd: pidfd}}, err
 	})
 	r.register = func(pid, pidfd int, netns uint64) error {
 		if gone {
@@ -154,17 +156,17 @@ func TestScanRetriesExitedPasta(t *testing.T) {
 	if w == nil || len(events) != 1 || events[0].PastaTGID != 20 || events[0].NetNS != 7 {
 		t.Fatalf("pasta not registered on retry: %+v", events)
 	}
-	if w.pastaPid != 20 || !fds.isOpen(w.pastaFd) || !fds.isAlive(w.pastaFd) {
-		t.Fatalf("registered pasta identity: pid %d, fd %d", w.pastaPid, w.pastaFd)
+	if rp := w.pastas[20]; rp == nil || !fds.isOpen(rp.fd) || !fds.isAlive(rp.fd) {
+		t.Fatalf("registered pasta identity: %+v", w.pastas)
 	}
 }
 
 func TestScanFailsOnRegistrationError(t *testing.T) {
 	failure := errors.New("map full")
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(int) (int, int, error) {
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
 		pidfd, err := fds.open(20)
-		return 20, pidfd, err
+		return []pastaProc{{pid: 20, pidfd: pidfd}}, err
 	})
 	r.register = func(_, _ int, _ uint64) error { return failure }
 	r.add(10, 7, time.Now())
@@ -178,7 +180,7 @@ func TestScanFailsOnRegistrationError(t *testing.T) {
 
 func TestScanForgetsExitedWineserver(t *testing.T) {
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(int) (int, int, error) { return 0, -1, os.ErrNotExist })
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) { return nil, os.ErrNotExist })
 	r.add(10, 7, time.Now())
 	if err := r.scan(time.Now(), nil); err != nil || len(r.waiting) != 0 {
 		t.Fatalf("%v, %v", err, r.waiting)
@@ -196,9 +198,9 @@ func TestScanRegistersReplacementPasta(t *testing.T) {
 	registrations := 0
 	var events []Event
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(int) (int, int, error) {
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
 		pidfd, err := fds.open(found)
-		return found, pidfd, err
+		return []pastaProc{{pid: found, pidfd: pidfd}}, err
 	})
 	r.register = func(pid, pidfd int, netns uint64) error {
 		registrations++
@@ -210,7 +212,7 @@ func TestScanRegistersReplacementPasta(t *testing.T) {
 	if err := r.scan(start, consume); err != nil {
 		t.Fatal(err)
 	}
-	first := r.waiting[10].pastaFd
+	first := r.waiting[10].pastas[20].fd
 	found = 21
 	if err := r.scan(start.Add(scanInterval), consume); err != nil {
 		t.Fatal(err)
@@ -218,7 +220,7 @@ func TestScanRegistersReplacementPasta(t *testing.T) {
 	if registrations != 2 || len(events) != 2 || events[1].PastaTGID != 21 {
 		t.Fatalf("replacement not registered: registrations %d, events %+v", registrations, events)
 	}
-	second := r.waiting[10].pastaFd
+	second := r.waiting[10].pastas[21].fd
 	if second == first || fds.isOpen(first) || !fds.isOpen(second) {
 		t.Fatalf("pasta fd %d not replaced by %d", first, second)
 	}
@@ -228,7 +230,7 @@ func TestScanRegistersReplacementPasta(t *testing.T) {
 	if registrations != 2 || len(events) != 2 {
 		t.Fatalf("same pasta registered twice: registrations %d, events %+v", registrations, events)
 	}
-	if r.waiting[10].pastaFd != second {
+	if r.waiting[10].pastas[21].fd != second {
 		t.Fatal("the same pasta must keep the fd already held")
 	}
 	if leaked := fds.leaked(); len(leaked) != 2 {
@@ -244,9 +246,9 @@ func TestScanReregistersExecedPasta(t *testing.T) {
 	active := map[int]bool{}
 	var events []Event
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(int) (int, int, error) {
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
 		pidfd, err := fds.open(20)
-		return 20, pidfd, err
+		return []pastaProc{{pid: 20, pidfd: pidfd}}, err
 	})
 	r.register = func(pid, pidfd int, netns uint64) error {
 		registrations++
@@ -266,7 +268,7 @@ func TestScanReregistersExecedPasta(t *testing.T) {
 	if registrations != 1 {
 		t.Fatalf("active pasta registered again: registrations %d", registrations)
 	}
-	held := r.waiting[10].pastaFd
+	held := r.waiting[10].pastas[20].fd
 	active[held] = false
 	if err := r.scan(start.Add(time.Minute), consume); err != nil {
 		t.Fatal(err)
@@ -274,7 +276,7 @@ func TestScanReregistersExecedPasta(t *testing.T) {
 	if registrations != 2 || len(events) != 2 || events[1].PastaTGID != 20 {
 		t.Fatalf("exec'd pasta not registered again: registrations %d, events %+v", registrations, events)
 	}
-	if now := r.waiting[10].pastaFd; now == held || fds.isOpen(held) || !fds.isOpen(now) {
+	if now := r.waiting[10].pastas[20].fd; now == held || fds.isOpen(held) || !fds.isOpen(now) {
 		t.Fatalf("pasta fd %d not replaced by %d", held, now)
 	}
 }
@@ -284,9 +286,9 @@ func TestScanReregistersExecedPasta(t *testing.T) {
 // be released.
 func TestAddReplacesExitedWineserver(t *testing.T) {
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(int) (int, int, error) {
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
 		pidfd, err := fds.open(20)
-		return 20, pidfd, err
+		return []pastaProc{{pid: 20, pidfd: pidfd}}, err
 	})
 	r.register = func(_, _ int, _ uint64) error { return nil }
 	start := time.Now()
@@ -296,20 +298,27 @@ func TestAddReplacesExitedWineserver(t *testing.T) {
 	}
 	old := *r.waiting[10]
 	fds.exit(old.serverFd)
-	fds.exit(old.pastaFd)
+	for _, rp := range old.pastas {
+		fds.exit(rp.fd)
+	}
 	r.add(10, 8, start)
 	w := r.waiting[10]
-	if w == nil || w.netns != 8 || w.serverFd == old.serverFd || w.pastaPid != 0 {
+	if w == nil || w.netns != 8 || w.serverFd == old.serverFd || len(w.pastas) != 0 {
 		t.Fatalf("reused wineserver PID not replaced: %+v", w)
 	}
-	if fds.isOpen(old.serverFd) || fds.isOpen(old.pastaFd) {
-		t.Fatalf("old fds %d, %d kept open", old.serverFd, old.pastaFd)
+	if fds.isOpen(old.serverFd) {
+		t.Fatalf("old server fd %d kept open", old.serverFd)
+	}
+	for _, rp := range old.pastas {
+		if fds.isOpen(rp.fd) {
+			t.Fatalf("old pasta fd %d kept open", rp.fd)
+		}
 	}
 }
 
 func TestAddKeepsLiveWineserver(t *testing.T) {
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(int) (int, int, error) { return 0, -1, nil })
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) { return nil, nil })
 	start := time.Now()
 	r.add(10, 7, start)
 	serverFd := r.waiting[10].serverFd
@@ -325,10 +334,10 @@ func TestAddKeepsLiveWineserver(t *testing.T) {
 func TestScanDropsExitedWineserverFd(t *testing.T) {
 	finds := 0
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(int) (int, int, error) {
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
 		finds++
 		pidfd, err := fds.open(20)
-		return 20, pidfd, err
+		return []pastaProc{{pid: 20, pidfd: pidfd}}, err
 	})
 	r.register = func(_, _ int, _ uint64) error { return nil }
 	start := time.Now()
@@ -353,12 +362,12 @@ func TestScanDropsExitedWineserverFd(t *testing.T) {
 
 func TestCloseReleasesHeldFds(t *testing.T) {
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(server int) (int, int, error) {
+	r := testRelays(t, fds, func(server int) ([]pastaProc, error) {
 		if server != 10 {
-			return 0, -1, nil
+			return nil, nil
 		}
 		pidfd, err := fds.open(20)
-		return 20, pidfd, err
+		return []pastaProc{{pid: 20, pidfd: pidfd}}, err
 	})
 	r.register = func(_, _ int, _ uint64) error { return nil }
 	start := time.Now()
@@ -382,8 +391,8 @@ func TestCloseReleasesHeldFds(t *testing.T) {
 func TestScanReportsDistinctLookupErrorsOnce(t *testing.T) {
 	var logged []string
 	fds := newFakeFds()
-	r := testRelays(t, fds, func(int) (int, int, error) {
-		return 0, -1, errors.New("permission denied")
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
+		return nil, errors.New("permission denied")
 	})
 	r.logf = func(format string, args ...any) {
 		logged = append(logged, fmt.Sprintf(format, args...))
@@ -510,5 +519,300 @@ func TestDNSTranslation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// pasta treats none as unsetting an option, including one set earlier.
+func TestDNSOptionsNoneClearsEarlierAddress(t *testing.T) {
+	got, err := dnsTranslation([]string{"pasta", "--dns-forward", "169.254.1.1", "--dns-forward", "none"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("translation %v, want none", got)
+	}
+	got, err = dnsTranslation([]string{"pasta", "--dns-forward", "169.254.1.1", "--dns-host", "192.0.2.99", "--dns-host", "none"})
+	if err == nil || !strings.Contains(err.Error(), "--dns-forward 169.254.1.1 without --dns-host") {
+		t.Fatalf("got %v, want a missing --dns-host error", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("translation %v, want none", got)
+	}
+}
+
+// One family without --dns-host must not drop the other family's mapping; the
+// valid forward is installed and the missing host is reported once.
+func TestDNSRegisterInstallsPartialFamilyAndReportsOnce(t *testing.T) {
+	forward := netip.MustParseAddr("169.254.1.1").As16()
+	host := netip.MustParseAddr("192.0.2.99").As16()
+	translation, dnsErr := dnsTranslation([]string{"pasta", "--dns-forward", "169.254.1.1", "--dns-host", "192.0.2.99", "--dns-forward", "fd00::1"})
+	if dnsErr == nil || !strings.Contains(dnsErr.Error(), "--dns-forward fd00::1 without --dns-host") {
+		t.Fatalf("got %v, want the IPv6 missing --dns-host error", dnsErr)
+	}
+	if len(translation) != 1 || translation[forward] != host {
+		t.Fatalf("translation %v, want the IPv4 mapping", translation)
+	}
+
+	var logged []string
+	installed := map[forwardKey]dnsForward{}
+	fds := newFakeFds()
+	r := testRelays(t, fds, nil)
+	r.dns = func(int) (map[[16]byte][16]byte, error) { return translation, dnsErr }
+	r.updateForward = func(key forwardKey, value dnsForward) error {
+		installed[key] = value
+		return nil
+	}
+	r.deleteForward = func(key forwardKey) error {
+		delete(installed, key)
+		return nil
+	}
+	r.logf = func(format string, args ...any) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+	start := time.Now()
+	r.add(10, 7, start)
+	fd, ferr := fds.open(20)
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	rp := &registeredPasta{pid: 20, fd: fd}
+	r.waiting[10].pastas = map[int]*registeredPasta{20: rp}
+	r.registerDNS(rp, 7)
+	key := forwardKey{NetNS: 7, Address: forward}
+	if installed[key].Resolver != host || !slices.Contains(rp.forwards, key) {
+		t.Fatalf("IPv4 forward not installed: installed %v, forwards %v", installed, rp.forwards)
+	}
+	if len(logged) != 1 || !strings.Contains(logged[0], "--dns-forward fd00::1 without --dns-host") {
+		t.Fatalf("reported %v, want the missing IPv6 host once", logged)
+	}
+	r.registerDNS(rp, 7)
+	if len(logged) != 1 {
+		t.Fatalf("reported %d times: %v", len(logged), logged)
+	}
+}
+
+// A replacement pasta on the same namespace takes over the forwards it names,
+// and the ones only the old pasta used are deleted.
+func TestScanPrunesReplacedPastaForwards(t *testing.T) {
+	a := netip.MustParseAddr("169.254.1.1").As16()
+	b := netip.MustParseAddr("169.254.2.2").As16()
+	host := netip.MustParseAddr("192.0.2.99").As16()
+	installed := map[forwardKey]dnsForward{}
+	found := 20
+	fds := newFakeFds()
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
+		pidfd, err := fds.open(found)
+		return []pastaProc{{pid: found, pidfd: pidfd}}, err
+	})
+	r.register = func(_, _ int, _ uint64) error { return nil }
+	r.dns = func(pid int) (map[[16]byte][16]byte, error) {
+		if pid == 20 {
+			return map[[16]byte][16]byte{a: host}, nil
+		}
+		return map[[16]byte][16]byte{b: host}, nil
+	}
+	r.updateForward = func(key forwardKey, value dnsForward) error {
+		installed[key] = value
+		return nil
+	}
+	r.deleteForward = func(key forwardKey) error {
+		delete(installed, key)
+		return nil
+	}
+	consume := func(Event) error { return nil }
+	start := time.Now()
+	r.add(10, 7, start)
+	if err := r.scan(start, consume); err != nil {
+		t.Fatal(err)
+	}
+	keyA := forwardKey{NetNS: 7, Address: a}
+	if _, ok := installed[keyA]; !ok {
+		t.Fatalf("forward A not installed: %v", installed)
+	}
+	found = 21
+	if err := r.scan(start.Add(scanInterval), consume); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := installed[keyA]; ok {
+		t.Fatalf("replaced pasta's forward A left behind: %v", installed)
+	}
+	keyB := forwardKey{NetNS: 7, Address: b}
+	if installed[keyB].Resolver != host {
+		t.Fatalf("replacement's forward B not installed: %v", installed)
+	}
+}
+
+// Two pastas on the same namespace each keep their forward while both live; when
+// one exits only its own forward is deleted.
+func TestScanKeepsForwardsOfOtherPasta(t *testing.T) {
+	a := netip.MustParseAddr("169.254.1.1").As16()
+	b := netip.MustParseAddr("169.254.2.2").As16()
+	host := netip.MustParseAddr("192.0.2.99").As16()
+	installed := map[forwardKey]dnsForward{}
+	pids := []int{20, 21}
+	fds := newFakeFds()
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
+		found := make([]pastaProc, 0, len(pids))
+		for _, pid := range pids {
+			pidfd, err := fds.open(pid)
+			if err != nil {
+				return nil, err
+			}
+			found = append(found, pastaProc{pid: pid, pidfd: pidfd})
+		}
+		return found, nil
+	})
+	r.register = func(_, _ int, _ uint64) error { return nil }
+	r.dns = func(pid int) (map[[16]byte][16]byte, error) {
+		if pid == 20 {
+			return map[[16]byte][16]byte{a: host}, nil
+		}
+		return map[[16]byte][16]byte{b: host}, nil
+	}
+	r.updateForward = func(key forwardKey, value dnsForward) error {
+		installed[key] = value
+		return nil
+	}
+	r.deleteForward = func(key forwardKey) error {
+		delete(installed, key)
+		return nil
+	}
+	consume := func(Event) error { return nil }
+	start := time.Now()
+	r.add(10, 7, start)
+	if err := r.scan(start, consume); err != nil {
+		t.Fatal(err)
+	}
+	keyA := forwardKey{NetNS: 7, Address: a}
+	keyB := forwardKey{NetNS: 7, Address: b}
+	if _, ok := installed[keyA]; !ok {
+		t.Fatalf("forward A not installed: %v", installed)
+	}
+	if _, ok := installed[keyB]; !ok {
+		t.Fatalf("forward B not installed: %v", installed)
+	}
+	fd20, fd21 := r.waiting[10].pastas[20].fd, r.waiting[10].pastas[21].fd
+	pids = []int{21}
+	if err := r.scan(start.Add(scanInterval), consume); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := installed[keyA]; ok {
+		t.Fatalf("exited pasta's forward A left behind: %v", installed)
+	}
+	if _, ok := installed[keyB]; !ok {
+		t.Fatalf("live pasta's forward B was deleted: %v", installed)
+	}
+	if fds.isOpen(fd20) || !fds.isOpen(fd21) {
+		t.Fatalf("exited pasta fd %d or live pasta fd %d released wrongly", fd20, fd21)
+	}
+}
+
+// A pasta the observer may not inspect is reported, not silently ignored.
+func TestRelaysForPropagatesPermissionError(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root can read a mode 0000 directory")
+	}
+	proc := t.TempDir()
+	const pid = 41
+	dir := filepath.Join(proc, strconv.Itoa(pid))
+	if err := os.MkdirAll(filepath.Join(dir, "ns"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/run/netns/pasta", filepath.Join(dir, "ns", "net")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dir, "fd"), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(filepath.Join(dir, "fd"), 0o755) })
+	matches, err := relaysForAt(proc, pid, "/run/netns/server")
+	if matches || !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("relaysForAt = %v, %v; want a permission error", matches, err)
+	}
+
+	var logged []string
+	fds := newFakeFds()
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
+		if _, err := relaysForAt(proc, pid, "/run/netns/server"); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
+	r.logf = func(format string, args ...any) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+	start := time.Now()
+	r.add(10, 7, start)
+	if err := r.scan(start, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(logged) != 1 || !strings.Contains(logged[0], "permission denied") {
+		t.Fatalf("logged %v, want one permission error", logged)
+	}
+	if err := r.scan(start.Add(time.Second), nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(logged) != 1 {
+		t.Fatalf("logged %d times: %v", len(logged), logged)
+	}
+}
+
+// One wineserver can own more than one pasta on the same namespace. Each is
+// registered and held separately, so one exiting leaves the other in place.
+func TestScanRegistersMultiplePastasPerNetns(t *testing.T) {
+	var events []Event
+	registrations := 0
+	pids := []int{20, 21}
+	fds := newFakeFds()
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
+		found := make([]pastaProc, 0, len(pids))
+		for _, pid := range pids {
+			pidfd, err := fds.open(pid)
+			if err != nil {
+				return nil, err
+			}
+			found = append(found, pastaProc{pid: pid, pidfd: pidfd})
+		}
+		return found, nil
+	})
+	r.register = func(pid, pidfd int, netns uint64) error {
+		registrations++
+		return nil
+	}
+	consume := func(e Event) error { events = append(events, e); return nil }
+	start := time.Now()
+	r.add(10, 7, start)
+	if err := r.scan(start, consume); err != nil {
+		t.Fatal(err)
+	}
+	if registrations != 2 || len(events) != 2 || events[0].PastaTGID != 20 || events[1].PastaTGID != 21 {
+		t.Fatalf("pastas not both registered: registrations %d, events %+v", registrations, events)
+	}
+	w := r.waiting[10]
+	fd20, fd21 := w.pastas[20].fd, w.pastas[21].fd
+	if !fds.isOpen(fd20) || !fds.isOpen(fd21) {
+		t.Fatalf("registered fds %d, %d not both open", fd20, fd21)
+	}
+	if err := r.scan(start.Add(scanInterval), consume); err != nil {
+		t.Fatal(err)
+	}
+	if registrations != 2 || len(events) != 2 {
+		t.Fatalf("same pastas registered again: registrations %d, events %+v", registrations, events)
+	}
+	if w.pastas[20].fd != fd20 || w.pastas[21].fd != fd21 {
+		t.Fatalf("live pastas' fds changed: %+v", w.pastas)
+	}
+	pids = []int{21}
+	if err := r.scan(start.Add(2*scanInterval), consume); err != nil {
+		t.Fatal(err)
+	}
+	if registrations != 2 || len(events) != 2 {
+		t.Fatalf("exiting pasta registered again: registrations %d, events %+v", registrations, events)
+	}
+	if w.pastas[20] != nil || !fds.isOpen(fd21) || fds.isOpen(fd20) {
+		t.Fatalf("pasta 20 removed wrongly: %+v, fds %d %d", w.pastas, fd20, fd21)
 	}
 }

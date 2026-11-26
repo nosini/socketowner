@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -77,6 +78,13 @@ var cgroupPrograms = []string{"sock_create", "connect4", "connect6", "sendmsg4",
 
 // The LSM programs in the exec-path object; seed_tasks is run, not attached.
 var execPrograms = []string{"record_exec", "record_fork", "record_free", "record_send", "record_connect"}
+
+// The seeding iterator skips a task when bpf_iter_task_vma_new is busy, so it
+// is run again a few times with growing delays.
+const (
+	seedMaxAttempts = 5
+	seedRetryDelay  = 10 * time.Millisecond
+)
 
 func main() {
 	cgroup := flag.String("cgroup", "/sys/fs/cgroup", "cgroup v2 directory to attach to")
@@ -284,6 +292,24 @@ func makePinDirs(pin string, gid int) (links, maps string, err error) {
 	return links, maps, nil
 }
 
+// seedWithRetries runs the seeding iterator until a pass leaves no task behind
+// as busy, or maxAttempts passes have been made. A read failure stops at once.
+func seedWithRetries(maxAttempts int, run func() (uint64, error), sleep func(time.Duration)) error {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		busy, err := run()
+		if err != nil {
+			return err
+		}
+		if busy == 0 {
+			return nil
+		}
+		if attempt+1 < maxAttempts && sleep != nil {
+			sleep(seedRetryDelay * time.Duration(attempt+1))
+		}
+	}
+	return nil
+}
+
 // attachExec attaches the exec-path hooks, adds the processes that are already
 // running and pins the maps.
 func attachExec(coll *ebpf.Collection, links, maps string, gid int) error {
@@ -299,20 +325,41 @@ func attachExec(coll *ebpf.Collection, links, maps string, gid int) error {
 		}
 	}
 
-	// Each read of the iterator runs seed_tasks on the next process.
+	// Each read of the iterator runs seed_tasks on the next process. A task
+	// that could not be read because its mmap lock was busy is counted in
+	// seed_busy, and another pass picks it up.
 	it, err := link.AttachIter(link.IterOptions{Program: coll.Programs["seed_tasks"]})
 	if err != nil {
 		return fmt.Errorf("attach seed_tasks: %w", err)
 	}
 	defer it.Close()
-	r, err := it.Open()
+	busyMap := coll.Maps["seed_busy"]
+	err = seedWithRetries(seedMaxAttempts, func() (uint64, error) {
+		if busyMap != nil {
+			if err := busyMap.Update(uint32(0), uint64(0), ebpf.UpdateAny); err != nil {
+				return 0, fmt.Errorf("seed_tasks: %w", err)
+			}
+		}
+		r, err := it.Open()
+		if err != nil {
+			return 0, fmt.Errorf("seed_tasks: %w", err)
+		}
+		_, err = io.Copy(io.Discard, r)
+		r.Close()
+		if err != nil {
+			return 0, fmt.Errorf("seed_tasks: %w", err)
+		}
+		if busyMap == nil {
+			return 0, nil
+		}
+		var busy uint64
+		if err := busyMap.Lookup(uint32(0), &busy); err != nil {
+			return 0, fmt.Errorf("seed_tasks: %w", err)
+		}
+		return busy, nil
+	}, time.Sleep)
 	if err != nil {
-		return fmt.Errorf("seed_tasks: %w", err)
-	}
-	_, err = io.Copy(io.Discard, r)
-	r.Close()
-	if err != nil {
-		return fmt.Errorf("seed_tasks: %w", err)
+		return err
 	}
 
 	for _, name := range execMapNames {

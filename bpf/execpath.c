@@ -171,6 +171,7 @@ struct {
 // kernfs names are at most NAME_MAX bytes.
 #define CGROUP_NAME_SIZE 256
 #define ENAMETOOLONG 36
+#define EBUSY 16
 
 struct cgroup_path {
 	__s32 len; // bytes in path including the NUL, or a negative errno
@@ -220,6 +221,15 @@ struct {
 	__type(value, struct exec_path);
 } seed_scratch SEC(".maps");
 
+// Tasks seed_tasks skipped because bpf_iter_task_vma_new returned -EBUSY
+// under mmap_write_lock contention. attachExec retries while nonzero.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} seed_busy SEC(".maps");
+
 // The update helper copies a whole record, so this also tells whether the
 // storage now holds what the caller wrote or something another program wrote.
 static __always_inline int same_record(const struct exec_path *a,
@@ -236,17 +246,21 @@ static __always_inline int same_record(const struct exec_path *a,
 // Fills in the path of a task's current executable. The VMA iterator pins the
 // task's mm for as long as the iterator lives, so its exe_file can't be freed
 // by a concurrent exit or exec while bpf_d_path reads it. The caller sets
-// start_ns. A task without an mm (kernel thread or exited) has no record.
+// start_ns. A task without an mm (kernel thread or exited) has no record. A
+// busy iterator reports that the task should be retried rather than hidden.
 static __always_inline int record_exe_path(struct task_struct *task,
-					   struct exec_path *e)
+					   struct exec_path *e, int *busy)
 {
 	struct bpf_iter_task_vma it;
 	struct vm_area_struct *v;
 	struct mm_struct *mm;
 	struct file *exe;
 	int found = 0;
+	int err = bpf_iter_task_vma_new(&it, task, 0);
 
-	if (bpf_iter_task_vma_new(&it, task, 0)) {
+	if (err) {
+		if (err == -EBUSY && busy)
+			*busy = 1;
 		bpf_iter_task_vma_destroy(&it);
 		return 0;
 	}
@@ -329,7 +343,7 @@ int BPF_PROG(record_fork, struct task_struct *task, unsigned long clone_flags,
 				 BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!e)
 		return 0;
-	if (record_exe_path(parent, e)) {
+	if (record_exe_path(parent, e, 0)) {
 		e->start_ns = bpf_ktime_get_boot_ns();
 		bpf_task_storage_get(&exec_tasks, task, e,
 				     BPF_LOCAL_STORAGE_GET_F_CREATE);
@@ -510,6 +524,7 @@ int seed_tasks(struct bpf_iter__task *ctx)
 	struct task_struct *task = ctx->task;
 	struct exec_path *e;
 	__u32 zero = 0;
+	int busy = 0;
 
 	if (!task || task->group_leader != task)
 		return 0;
@@ -523,8 +538,14 @@ int seed_tasks(struct bpf_iter__task *ctx)
 	e = bpf_map_lookup_elem(&seed_scratch, &zero);
 	if (!e)
 		return 0;
-	if (!record_exe_path(task, e)) // kernel thread, exited, or no executable
+	if (!record_exe_path(task, e, &busy)) { // kernel thread, exited, or no executable
+		if (busy) {
+			__u64 *count = bpf_map_lookup_elem(&seed_busy, &zero);
+			if (count)
+				__sync_fetch_and_add(count, 1);
+		}
 		return 0;
+	}
 	e->start_ns = task->start_boottime;
 	// record_exec may have started while the path was read; it updates the
 	// storage once it completes, and its own retry covers the other order.
