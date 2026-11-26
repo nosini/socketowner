@@ -45,10 +45,14 @@ func TestEmbeddedObjectLayout(t *testing.T) {
 	if len(spec.Programs) != 7 {
 		t.Fatalf("unexpected programs: %v", spec.Programs)
 	}
-	for _, name := range []string{"wine_file", "wine_file_free", "wine_create", "wine_connect", "wine_send", "wine_exec"} {
+	for _, name := range []string{"wine_file", "wine_create", "wine_connect", "wine_send", "wine_exec"} {
 		if spec.Programs[name].Type != ebpf.LSM {
 			t.Fatal(name)
 		}
+	}
+	if p := spec.Programs["wine_pipe_release"]; p == nil || p.Type != ebpf.Tracing ||
+		p.AttachType != ebpf.AttachTraceFExit || p.AttachTo != "pipe_release" {
+		t.Fatalf("wine_pipe_release must be fexit/pipe_release: %+v", p)
 	}
 	var owner *btf.Struct
 	if err := spec.Types.TypeByName("owner", &owner); err != nil {

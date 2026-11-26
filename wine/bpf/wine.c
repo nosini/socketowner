@@ -485,6 +485,43 @@ static __always_inline void read_client(struct task_struct *task, struct client 
 	c->status = KNOWN;
 }
 
+// Merges the published record c of the same process into scratch, keeping
+// what either side has learned: a KNOWN image, the wineserver (scratch's own
+// when have_server), the PEB and the Windows PID. Returns whether scratch then
+// differs from c, that is whether it is worth publishing.
+static __always_inline int merge_client(struct client *scratch, struct client *c, __u64 start_ns,
+					int have_server)
+{
+	__u64 server_start_ns = scratch->server_start_ns, peb = scratch->peb;
+	__u32 server_tgid = scratch->server_tgid, windows_pid = scratch->windows_pid;
+	if (c->status == KNOWN && scratch->status != KNOWN) {
+		if (bpf_probe_read_kernel(scratch, sizeof(*scratch), c) || scratch->start_ns != start_ns)
+			return 0;
+		if (have_server) {
+			scratch->server_tgid = server_tgid;
+			scratch->server_start_ns = server_start_ns;
+		}
+		if (!scratch->peb)
+			scratch->peb = peb;
+		if (!scratch->windows_pid)
+			scratch->windows_pid = windows_pid;
+	} else {
+		if (!have_server && c->server_tgid && c->server_start_ns) {
+			scratch->server_tgid = c->server_tgid;
+			scratch->server_start_ns = c->server_start_ns;
+		}
+		if (!scratch->peb)
+			scratch->peb = c->peb;
+		if (!scratch->windows_pid)
+			scratch->windows_pid = c->windows_pid;
+	}
+	return (scratch->status == KNOWN && c->status != KNOWN) ||
+	       scratch->server_tgid != c->server_tgid ||
+	       scratch->server_start_ns != c->server_start_ns ||
+	       scratch->peb != c->peb ||
+	       scratch->windows_pid != c->windows_pid;
+}
+
 // Updates clients[tgid] atomically from thread-local scratch so readers never
 // observe a half-initialized record (such as server_tgid without
 // server_start_ns) or a failed read zeroing a published KNOWN image.
@@ -518,45 +555,16 @@ static __always_inline void update_client(struct task_struct *task, __u32 tgid, 
 	}
 	if (scratch->status != KNOWN)
 		read_client(task, scratch, sleepable);
-	if (!same_proc) {
-		if (!c) {
-			if (bpf_map_update_elem(&clients, &tgid, scratch, BPF_NOEXIST) == 0)
-				goto done;
-		} else {
-			bpf_map_update_elem(&clients, &tgid, scratch, BPF_ANY);
-			goto done;
-		}
-	}
-	// Re-check the published entry so a concurrent thread's progress
-	// (such as resolving KNOWN or recording a wineserver) is never lost.
+	if (!c && bpf_map_update_elem(&clients, &tgid, scratch, BPF_NOEXIST) == 0)
+		goto done;
+	// Merge with the entry published now, so a concurrent thread's progress
+	// (a resolved image, a recorded wineserver, the PEB or the Windows PID) is
+	// never replaced by this thread's emptier view. An entry left by an earlier
+	// process with the same TGID is replaced outright.
 	c = bpf_map_lookup_elem(&clients, &tgid);
-	if (!c || c->start_ns != start_ns) {
-		bpf_map_update_elem(&clients, &tgid, scratch, BPF_ANY);
+	if (c && c->start_ns == start_ns && !merge_client(scratch, c, start_ns, have_server))
 		goto done;
-	}
-	if (c->status == KNOWN) {
-		if (scratch->status != KNOWN) {
-			if (!have_server ||
-			    (c->server_tgid == server_tgid && c->server_start_ns == server_start_ns))
-				goto done;
-			if (bpf_probe_read_kernel(scratch, sizeof(*scratch), c) || scratch->start_ns != start_ns)
-				goto done;
-			scratch->server_tgid = server_tgid;
-			scratch->server_start_ns = server_start_ns;
-		}
-		bpf_map_update_elem(&clients, &tgid, scratch, BPF_ANY);
-		goto done;
-	}
-	if (!scratch->server_tgid && c->server_tgid && c->server_start_ns) {
-		scratch->server_tgid = c->server_tgid;
-		scratch->server_start_ns = c->server_start_ns;
-	}
-	if (scratch->status == KNOWN ||
-	    scratch->server_tgid != c->server_tgid ||
-	    scratch->server_start_ns != c->server_start_ns ||
-	    scratch->peb != c->peb ||
-	    scratch->windows_pid != c->windows_pid)
-		bpf_map_update_elem(&clients, &tgid, scratch, BPF_ANY);
+	bpf_map_update_elem(&clients, &tgid, scratch, BPF_ANY);
 done:
 	bpf_task_storage_delete(&client_scratch, task);
 }
@@ -625,17 +633,17 @@ int BPF_PROG(wine_file, struct file *file, int mask, int ret)
 
 // Prunes closed pipes from request_pipes once all ends have closed, so exited
 // Wine threads do not accumulate and evict live idle request pipes.
-// pipe_release clears inode->i_pipe before security_file_free runs when the
-// last reader and writer close; while either end stays open, i_pipe remains
-// non-NULL so buffered requests can still be attributed.
-SEC("lsm/file_free_security")
-int BPF_PROG(wine_file_free, struct file *file)
+// pipe_release clears inode->i_pipe when the last reader and writer close;
+// while either end stays open, i_pipe remains non-NULL so buffered requests can
+// still be attributed. This runs on return from pipe_release, while __fput
+// still holds the file's dentry and so the inode. security_file_free runs only
+// after __fput has dropped them, when a closed anonymous pipe's inode may
+// already be freed.
+SEC("fexit/pipe_release")
+int BPF_PROG(wine_pipe_release, struct inode *inode, struct file *file, int ret)
 {
-	struct inode *inode = file->f_inode;
 	struct pipe_key key = {};
-	if (!inode || (inode->i_mode & S_IFMT) != S_IFIFO)
-		return 0;
-	if (inode->i_pipe)
+	if (!inode || inode->i_pipe)
 		return 0;
 	key.inode = (__u64)inode;
 	key.ino = inode->i_ino;

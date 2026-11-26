@@ -82,6 +82,22 @@ func (s *eventSink) emit(e Event) error {
 	return nil
 }
 
+// emitLoss reports lost events. A loss event that cannot be queued adds lost
+// back to the dropped count instead of 1, so a full queue cannot collapse many
+// lost events into one. The loss event itself is not counted again: the next
+// report carries exactly the losses still undelivered.
+func (s *eventSink) emitLoss(lost uint64) error {
+	if err := s.err(); err != nil {
+		return err
+	}
+	select {
+	case s.queue <- Event{Type: "loss", Observer: s.observerID, LostEvents: lost}:
+	default:
+		s.dropped.Add(lost)
+	}
+	return nil
+}
+
 func (s *eventSink) takeDropped() uint64 {
 	return s.dropped.Swap(0)
 }
@@ -210,8 +226,14 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 			links[i].Close()
 		}
 	}()
-	for _, name := range []string{"wine_exec", "wine_file", "wine_file_free", "wine_create", "wine_connect", "wine_send"} {
-		l, err := link.AttachLSM(link.LSMOptions{Program: coll.Programs[name]})
+	for _, name := range []string{"wine_exec", "wine_file", "wine_pipe_release", "wine_create", "wine_connect", "wine_send"} {
+		var l link.Link
+		var err error
+		if coll.Programs[name].Type() == ebpf.Tracing {
+			l, err = link.AttachTracing(link.TracingOptions{Program: coll.Programs[name]})
+		} else {
+			l, err = link.AttachLSM(link.LSMOptions{Program: coll.Programs[name]})
+		}
 		if err != nil {
 			return fmt.Errorf("attach %s: %w", name, err)
 		}
@@ -287,7 +309,7 @@ func Observe(ctx context.Context, options Options, consume func(Event) error) er
 		lost := (losses - reportedLosses) + sink.takeDropped()
 		if lost != 0 {
 			reportedLosses = losses
-			if err := sink.emit(Event{Type: "loss", LostEvents: lost}); err != nil {
+			if err := sink.emitLoss(lost); err != nil {
 				return err
 			}
 		}

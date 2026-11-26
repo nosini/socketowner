@@ -83,3 +83,42 @@ func TestEventSinkPropagatesConsumerError(t *testing.T) {
 		t.Fatalf("close() = %v, want %v", err, want)
 	}
 }
+
+// A loss event that cannot be queued must not collapse the losses it reports:
+// the full count stays pending for the next report.
+func TestEventSinkLossNotCollapsedByFullQueue(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	sink := newEventSink("obs-3", 2, func(e Event) error {
+		if e.Type == "ready" {
+			close(entered)
+			<-release
+		}
+		return nil
+	})
+	if err := sink.emit(Event{Type: "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("consumer never received ready event")
+	}
+	// Fill the buffer (capacity 2).
+	for range 2 {
+		if err := sink.emit(Event{Type: "create"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sink.emitLoss(700); err != nil {
+		t.Fatal(err)
+	}
+	// The loss event itself is not counted again.
+	if dropped := sink.takeDropped(); dropped != 700 {
+		t.Fatalf("dropped = %d, want 700", dropped)
+	}
+	close(release)
+	if err := sink.close(time.Second); err != nil {
+		t.Fatal(err)
+	}
+}

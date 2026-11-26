@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -235,6 +236,41 @@ func TestScanRegistersReplacementPasta(t *testing.T) {
 	}
 	if leaked := fds.leaked(); len(leaked) != 2 {
 		t.Fatalf("fds %v left open", leaked)
+	}
+}
+
+// A scan that found a pasta but could not inspect every process must not
+// prune the pastas already held: a live one was missed, not replaced.
+func TestScanKeepsLivePastaOnPartialScanError(t *testing.T) {
+	live := 20
+	fds := newFakeFds()
+	r := testRelays(t, fds, func(int) ([]pastaProc, error) {
+		pidfd, err := fds.open(live)
+		return []pastaProc{{pid: live, pidfd: pidfd}}, err
+	})
+	r.register = func(_, _ int, _ uint64) error { return nil }
+	consume := func(Event) error { return nil }
+	start := time.Now()
+	r.add(10, 7, start)
+	if err := r.scan(start, consume); err != nil {
+		t.Fatal(err)
+	}
+	held := r.waiting[10].pastas[20].fd
+	// The next scan finds a new pasta but is denied part of /proc.
+	live = 21
+	r.find = func(int) ([]pastaProc, error) {
+		pidfd, _ := fds.open(live)
+		return []pastaProc{{pid: 21, pidfd: pidfd}}, os.ErrPermission
+	}
+	if err := r.scan(start.Add(scanInterval), consume); err != nil {
+		t.Fatal(err)
+	}
+	w := r.waiting[10]
+	if w.pastas[20] == nil || !fds.isOpen(held) {
+		t.Fatalf("held pasta dropped after a partial scan error: %+v", w.pastas)
+	}
+	if w.pastas[21] == nil {
+		t.Fatalf("new pasta not registered: %+v", w.pastas)
 	}
 }
 
@@ -757,6 +793,88 @@ func TestRelaysForPropagatesPermissionError(t *testing.T) {
 	}
 	if len(logged) != 1 {
 		t.Fatalf("logged %d times: %v", len(logged), logged)
+	}
+}
+
+// The comm names are globals so their addresses stay valid in a forked child,
+// where only raw syscalls may run.
+var (
+	pastaCommName = [...]byte{'p', 'a', 's', 't', 'a', 0}
+	passtCommName = [...]byte{'p', 'a', 's', 's', 't', 0}
+)
+
+// hiddenExeChild forks a child that takes name as its comm and turns itself
+// non-dumpable: /proc/<pid>/exe then denies its read link to a process without
+// CAP_SYS_PTRACE, exactly as a pasta under a hardened policy does, while
+// /proc/<pid>/comm stays world-readable. The child lives until killed.
+func hiddenExeChild(t *testing.T, name *[6]byte) int {
+	t.Helper()
+	pid, _, errno := unix.RawSyscall6(unix.SYS_CLONE, uintptr(unix.SIGCHLD), 0, 0, 0, 0, 0)
+	if errno != 0 {
+		t.Skipf("fork: %v", errno)
+	}
+	if pid == 0 {
+		unix.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_NAME, uintptr(unsafe.Pointer(&name[0])), 0, 0, 0, 0)
+		unix.RawSyscall6(unix.SYS_PRCTL, unix.PR_SET_DUMPABLE, 0, 0, 0, 0, 0)
+		for {
+			unix.RawSyscall6(unix.SYS_PAUSE, 0, 0, 0, 0, 0, 0)
+		}
+	}
+	child := int(pid)
+	t.Cleanup(func() {
+		unix.Kill(child, unix.SIGKILL)
+		var status unix.WaitStatus
+		unix.Wait4(child, &status, 0, nil)
+	})
+	return child
+}
+
+// A pasta the observer may not inspect is not silently ignored: its exe link
+// denies reading while comm stays readable, and comm names pasta. A process
+// the observer may not inspect whose comm names no pasta is still skipped.
+func TestIsPastaReportsUnreadableExe(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root can read any process's exe link")
+	}
+	pasta := hiddenExeChild(t, &pastaCommName)
+	passt := hiddenExeChild(t, &passtCommName)
+	// Wait until both children have their names and deny exe reads, so the
+	// assertions cannot race the children's prctls.
+	deadline := time.Now().Add(5 * time.Second)
+	hidden := func(pid int, comm string) bool {
+		got, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		if err != nil || !strings.HasPrefix(string(got), comm) {
+			return false
+		}
+		_, err = os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+		return err != nil
+	}
+	for !hidden(pasta, "pasta") || !hidden(passt, "passt") {
+		if time.Now().After(deadline) {
+			t.Skip("exe links stayed readable; cannot test an unreadable exe")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	found, err := isPastaAt("/proc", pasta)
+	if found || err == nil || !errors.Is(err, os.ErrPermission) ||
+		!strings.Contains(err.Error(), fmt.Sprintf("pasta %d", pasta)) {
+		t.Fatalf("isPastaAt(pasta) = %v, %v; want the exe permission error", found, err)
+	}
+	found, err = isPastaAt("/proc", passt)
+	if found || err != nil {
+		t.Fatalf("isPastaAt(passt) = %v, %v; want no error", found, err)
+	}
+
+	// findPastasAt reports the unreadable pasta and keeps scanning: the scan
+	// of the rest of /proc completes and joins the error into its result.
+	_, err = findPastasAt("/proc", os.Getpid())
+	if err == nil || !errors.Is(err, os.ErrPermission) ||
+		!strings.Contains(err.Error(), fmt.Sprintf("pasta %d", pasta)) {
+		t.Fatalf("findPastasAt = %v; want the pasta %d exe permission error", err, pasta)
+	}
+	if err != nil && strings.Contains(err.Error(), fmt.Sprintf("pasta %d", passt)) {
+		t.Fatalf("findPastasAt reported the non-pasta child: %v", err)
 	}
 }
 

@@ -213,14 +213,28 @@ func findPastasAt(proc string, server int) ([]pastaProc, error) {
 	var errs []error
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || !isPastaAt(proc, pid) {
+		if err != nil {
+			continue
+		}
+		pasta, perr := isPastaAt(proc, pid)
+		if perr != nil {
+			errs = append(errs, perr)
+			continue
+		}
+		if !pasta {
 			continue
 		}
 		pidfd, err := unix.PidfdOpen(pid, 0)
 		if err != nil {
 			continue
 		}
-		if !isPastaAt(proc, pid) {
+		pasta, perr = isPastaAt(proc, pid)
+		if perr != nil {
+			unix.Close(pidfd)
+			errs = append(errs, perr)
+			continue
+		}
+		if !pasta {
 			unix.Close(pidfd)
 			continue
 		}
@@ -239,13 +253,29 @@ func findPastasAt(proc string, server int) ([]pastaProc, error) {
 	return found, errors.Join(errs...)
 }
 
-func isPasta(pid int) bool {
+func isPasta(pid int) (bool, error) {
 	return isPastaAt("/proc", pid)
 }
 
-func isPastaAt(proc string, pid int) bool {
+// isPastaAt reports whether the process is pasta by the name of its
+// executable. A process the observer may not inspect denies reading that
+// link; its comm stays world-readable, so a pasta named there is reported
+// instead of silently ignored, as relaysFor reports processes it may not
+// inspect.
+func isPastaAt(proc string, pid int) (bool, error) {
 	exe, err := os.Readlink(filepath.Join(proc, strconv.Itoa(pid), "exe"))
-	return err == nil && strings.Contains(filepath.Base(exe), "pasta")
+	if err == nil {
+		return strings.Contains(filepath.Base(exe), "pasta"), nil
+	}
+	// EACCES and EPERM both count, as for a hardened policy's denials.
+	if !errors.Is(err, os.ErrPermission) {
+		return false, nil
+	}
+	comm, cerr := os.ReadFile(filepath.Join(proc, strconv.Itoa(pid), "comm"))
+	if cerr != nil || !strings.Contains(string(comm), "pasta") {
+		return false, nil
+	}
+	return false, fmt.Errorf("pasta %d: %w", pid, err)
 }
 
 func relaysFor(pid int, netns string) (bool, error) {
@@ -386,6 +416,11 @@ func (r *relays) scan(now time.Time, consume func(Event) error) error {
 		}
 		for pid, old := range w.pastas {
 			if seen[pid] {
+				continue
+			}
+			// A scan that failed may only have missed a live pasta, as one
+			// that found none does; keep it then too.
+			if err != nil && r.alive(old.fd) {
 				continue
 			}
 			delete(w.pastas, pid)

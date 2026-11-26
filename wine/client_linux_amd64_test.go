@@ -22,7 +22,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -892,10 +891,26 @@ func TestConcurrentClientInitAndSockets(t *testing.T) {
 	}
 }
 
+// mincoreResident reports whether the first page of b is resident in memory.
+// x/sys/unix wraps no mincore, so this is the raw syscall; the page vector is
+// one entry because b is one page.
+func mincoreResident(b []byte) (bool, error) {
+	vec := make([]byte, 1)
+	_, _, errno := unix.Syscall(unix.SYS_MINCORE,
+		uintptr(unsafe.Pointer(unsafe.SliceData(b))), uintptr(len(b)),
+		uintptr(unsafe.Pointer(&vec[0])))
+	if errno != 0 {
+		return false, errno
+	}
+	return vec[0]&1 != 0, nil
+}
+
 // clientPageoutHelper maps a fake Windows identity, swaps out the ImagePathName
 // page with MADV_PAGEOUT before writing the FIFO (so non-sleepable
 // file_permission gets -EFAULT), and then creates a socket in its own process
 // so sleepable lsm.s/socket_post_create faults the page in via bpf_copy_from_user.
+// It announces whether the page actually left memory, checked with mincore:
+// without swap MADV_PAGEOUT leaves it resident, and the test proves nothing then.
 func clientPageoutHelper() error {
 	base, err := fakeWindowsIdentityMapped(helperWindows, helperImage)
 	if err != nil {
@@ -904,6 +919,17 @@ func clientPageoutHelper() error {
 	// Page out the ImagePathName buffer page before writing the request FIFO.
 	if err := unix.Madvise(base[0x3000:0x4000], unix.MADV_PAGEOUT); err != nil {
 		return fmt.Errorf("madvise MADV_PAGEOUT: %w", err)
+	}
+	resident, err := mincoreResident(base[0x3000:0x4000])
+	if err != nil {
+		return fmt.Errorf("mincore: %w", err)
+	}
+	state := "evicted"
+	if resident {
+		state = "resident"
+	}
+	if err := announce(state, 0); err != nil {
+		return err
 	}
 	request, err := os.OpenFile(os.Getenv(helperFIFO), os.O_WRONLY, 0)
 	if err != nil {
@@ -973,14 +999,6 @@ func serverTwoReqHelper() error {
 	return nil
 }
 
-func hasActiveSwap() bool {
-	data, err := os.ReadFile("/proc/swaps")
-	if err != nil {
-		return false
-	}
-	return len(strings.Split(strings.TrimSpace(string(data)), "\n")) > 1
-}
-
 // When ImagePathName is swapped out before file_permission runs, sleepable
 // lsm.s/socket_post_create must fault it back in with bpf_copy_from_user and
 // publish the KNOWN identity for both the client socket and subsequent
@@ -1000,9 +1018,10 @@ func TestSwappedOutImagePageResolvedOnSocketCreate(t *testing.T) {
 	server.await(t, "ready")
 	client := startHelper(t, "client-pageout", env)
 	client.await(t, "wrote")
-	// Trigger first wineserver socket before client creates any socket: with
-	// active swap, MADV_PAGEOUT causes non-sleepable file_permission to miss
-	// the swapped-out ImagePathName page and leave the client no-image.
+	// Trigger first wineserver socket before client creates any socket:
+	// non-sleepable file_permission misses the evicted ImagePathName page and
+	// leaves the client no-image. The helper announces with mincore whether
+	// the page really left memory, and the eviction is required below.
 	if _, err := server.stdin.Write([]byte("1")); err != nil {
 		t.Fatal(err)
 	}
@@ -1014,8 +1033,19 @@ func TestSwappedOutImagePageResolvedOnSocketCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstRec := flowRecord(t, flows, host, firstSock.Port, unix.IPPROTO_TCP)
-	if hasActiveSwap() && firstRec.Status != 3 {
-		t.Logf("note: first socket status=%d (page may have stayed resident)", firstRec.Status)
+	resident := false
+	for _, message := range client.messages() {
+		if message.Event == "resident" {
+			resident = true
+		}
+	}
+	if resident {
+		t.Skip("ImagePathName page stayed resident after MADV_PAGEOUT: no swap, or pageout was ignored")
+	}
+	// The page was evicted, so the first socket must have been named without
+	// its image; anything else means the eviction was not what caused it.
+	if firstRec.Status != 3 {
+		t.Fatalf("first socket status=%d, want no-image with the page evicted", firstRec.Status)
 	}
 
 	// Now let client create a socket: lsm.s/socket_post_create faults the page in.
@@ -1050,8 +1080,8 @@ func TestSwappedOutImagePageResolvedOnSocketCreate(t *testing.T) {
 	})
 }
 
-// Closing all ends of a pipe must prune its entry from request_pipes via
-// lsm/file_free_security, while closing only one end must keep the entry so
+// Closing all ends of a pipe must prune its entry from request_pipes on return
+// from pipe_release, while closing only one end must keep the entry so
 // buffered requests can still be read and attributed.
 func TestRequestPipePrunedOnClose(t *testing.T) {
 	if os.Geteuid() != 0 {
@@ -1078,7 +1108,7 @@ func TestRequestPipePrunedOnClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lFile.Close()
-	lFree, err := link.AttachLSM(link.LSMOptions{Program: coll.Programs["wine_file_free"]})
+	lFree, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs["wine_pipe_release"]})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1174,9 +1204,9 @@ func TestPreExistingClientPipeAfterObserverStart(t *testing.T) {
 	// Start server BEFORE observer, skipping initial read so the pipe exists
 	// unopened/unseen by the observer when the client makes its first write.
 	env := map[string]string{
-		helperFIFO:             fifo,
-		helperListener:         tcp,
-		helperUDP:              udp,
+		helperFIFO:               fifo,
+		helperListener:           tcp,
+		helperUDP:                udp,
 		"WINE_SKIP_INITIAL_READ": "1",
 	}
 	server := startHelper(t, "server-two-req", env)
