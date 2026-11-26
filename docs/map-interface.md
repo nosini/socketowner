@@ -146,9 +146,9 @@ unlike `conn_cgroups` no match against `conn_owners` is needed.
 Addresses and ports are the packet's as it leaves the egress hook, after
 netfilter's output and postrouting translation. A flow redirected to a local
 listener (`redirect`, as TUN `auto-redirect` does) is keyed by that listener's
-address and port, not by its original destination; a reader that knows both
-should look up each. An unconnected UDP socket gets a record for every
-destination it sends to.
+address and port, not by its original destination; a reader should look up the
+listener's address and port rather than the original destination. An unconnected
+UDP socket gets a record for every destination it sends to.
 
 Readers should prefer `conn_flows` when they know the flow's destination, and
 fall back to `conn_owners` when it has no record, as for flows sent before the

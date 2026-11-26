@@ -38,8 +38,7 @@ Pins are removed on exit; a crash leaves them until the next publisher.
 The observer needs host BPF/LSM and cgroup attachment privileges, and permission
 to inspect other processes' file descriptors to find pasta, so `CAP_SYS_PTRACE`
 and `CAP_DAC_READ_SEARCH` to list other users' `/proc/<pid>/fd` directories, in
-addition to `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`. Root in the test VM
-supplies these rights. The optional service and SELinux policy live in
+addition to `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`. The optional service and SELinux policy live in
 [hardened-proxy-service](https://github.com/nosini/hardened-proxy-service), not in
 this repository. The command sends systemd readiness after publishing its maps
 when `NOTIFY_SOCKET` is set. It refuses to start unless `bpf` appears in
@@ -109,13 +108,14 @@ protocol:
    a later pipe at a reused inode address does not become a client.
 2. Each later read records the client being served. wineserver is single-threaded
    and handles a request within the read which fetched it, so the sockets which
-   follow are that client's (`lsm/socket_post_create`).
+   follow are that client's (`lsm.s/socket_post_create`).
 3. The client names itself, read during its own write, while its memory is
    current. For 64-bit clients, GS holds the TEB, confirmed by `TEB.Self`, and
    `Peb`, `ProcessParameters` and `ImagePathName` lead to the full path. These are
    public Windows x86-64 layouts, not Wine's. If the path can't be read yet, the
-   client stays `no-image` and is retried on its next request; it does not fall
-   back to a mapped name.
+   client stays `no-image` and is retried on its next request (and with a
+   sleepable fault-in read when the client opens a socket itself, in case its
+   PEB or image page was swapped out); it does not fall back to a mapped name.
 4. Under old-style WOW64, the default of a Wine with 32-bit Unix libraries,
    32-bit programs run as true 32-bit Linux processes, so GS is glibc's TLS and that check fails.
    Encoding 1 is used only for such a client: the first mapping by address
@@ -127,8 +127,8 @@ protocol:
    and it is named by full path, with its Windows PID.
 
 A Windows program also opens sockets in its own Linux process: the glibc
-resolver behind `getaddrinfo`, GStreamer, libldap. The same
-`lsm/socket_post_create` finds their creator by process ID in the client
+resolver behind `getaddrinfo`, GStreamer, libldap. The same sleepable
+`lsm.s/socket_post_create` finds their creator by process ID in the client
 records, with the process's start time ruling out a reused ID, and labels them
 with that client's identity: status, image, encoding, Windows PID, client TGID
 and start time, and, in the fields which name a wineserver, the one that reads
@@ -144,7 +144,8 @@ The record is published before socket creation returns to userspace, and remains
 immutable in socket storage. Connect/send/egress hooks use that record instead of
 traversing an FD table or reconstructing an earlier request.
 
-wineserver is recognised by its process name. This supports cooperative Wine
+wineserver is recognised by its process name (`wineserver`, `wineserver64`,
+`wineserver32`, or `wineserver-*`). This supports cooperative Wine
 applications, not a security claim. A malicious process can rename itself, rewrite
 its own PEB, map a misleading file, or ask another program to do its networking.
 The cost: FIFO reads and writes system-wide pay about 130 ns per round trip, which
@@ -327,12 +328,14 @@ keeps its own record and joins as any other flow.
 
 A wineserver's first request tells BPF its network namespace, and from then on
 flows there are recorded, before any of its programs can have sent one. The
-observer then looks for the sandbox's pasta: a process outside that namespace,
-holding a descriptor for it, whose executable name contains `pasta`. A failed
-lookup is logged and retried; it does not stop the observer. Registration is
-keyed by pidfd and revoked on exec. A registered sandbox is checked again, so a
-pasta that replaces the previous one, or that exec'd and lost its registration, is
-registered again. No pasta memory is read,
+observer then looks for the sandbox's pasta processes: every process outside
+that namespace, holding a descriptor for it, whose executable name contains
+`pasta`. A failed lookup (including permission errors on `/proc/<pid>/fd`) is
+logged and retried; it does not stop the observer. Registration is keyed by
+pidfd and revoked on exec. A registered sandbox is checked again, so a
+replacement or additional pasta, or one that exec'd and lost its registration,
+is registered, and stale DNS forwards from an exited or replaced pasta are
+removed. No pasta memory is read,
 so its updates don't matter. A flow pasta connects before that registration has
 no record, and shows as pasta; this did not occur in testing, but nothing
 prevents it.
@@ -359,7 +362,7 @@ go generate ./wine
 go test ./...
 ```
 
-Privileged tests belong in the dedicated test VM, and run as the ordinary user;
+Privileged tests belong on a disposable test machine, and run as an ordinary user;
 only the observer, mihomo and test firewall rules use sudo:
 
 ```sh
