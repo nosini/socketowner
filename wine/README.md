@@ -37,7 +37,8 @@ Pins are removed on exit; a crash leaves them until the next publisher.
 
 The observer needs host BPF/LSM and cgroup attachment privileges, and permission
 to inspect other processes' file descriptors to find pasta, so `CAP_SYS_PTRACE`
-in addition to `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`. Root in the test VM
+and `CAP_DAC_READ_SEARCH` to list other users' `/proc/<pid>/fd` directories, in
+addition to `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`. Root in the test VM
 supplies these rights. The optional service and SELinux policy live in
 [hardened-proxy-service](https://github.com/nosini/hardened-proxy-service), not in
 this repository. The command sends systemd readiness after publishing its maps
@@ -151,7 +152,7 @@ was 37% in a benchmark doing nothing else.
 
 ## Routing maps
 
-`-pin DIR`, normally socketowner's `maps` directory, adds three optional pins
+`-pin DIR`, normally socketowner's `maps` directory, adds four optional pins
 beside its ABI v1 maps. V1 records are unchanged, so no v1 version change applies.
 These have their own version, currently 2, and their pins come and go with the
 observer. Each pin appears under its final name with its final owner and mode.
@@ -305,21 +306,24 @@ the forward address leaves through a socket connected to the host's resolver
 instead, so the inner record is keyed by that destination, which keeps the join
 exact, with the source port pasta preserves and the shared-key rules above
 unchanged. The observer learns the translation when it registers the pasta,
-from its command line, and a family maps only when that line names both its
+from its command line. Each family maps independently when that line names its
 `--dns-forward` address and its `--dns-host` address: pasta's default
 `--dns-host` comes from the resolv.conf of the environment it was started in,
 but pasta isolates itself into an empty root before the observer can register
-it, so that file can no longer be read. A pasta with `--dns-forward` but no
-`--dns-host` gets no mapping; the observer reports the missing address once
-for that pasta, and DNS to its forward address stays `wine-unknown`, so a
-sandbox that wants its DNS joined starts pasta with `--dns-host`. Only
-UDP and TCP to port 53 are translated, matching what pasta maps on the tested
-versions; pasta also maps port 853 on some versions, and those flows stay
-`wine-unknown`. Without `--dns-forward`, pasta maps its `--map-host-loopback`
-or default gateway address, whose host nameserver no command line names, and
-DNS in such sandboxes stays unknown. DNS sent to
-an address pasta does not map keeps its own record and joins as any other
-flow.
+it, so that file can no longer be read. A family with `--dns-forward` but no
+`--dns-host` gets no mapping even when the other family has both; the observer
+reports the missing address once for that pasta, and DNS to that forward
+address stays `wine-unknown`, so a sandbox that wants its DNS joined starts
+pasta with `--dns-host` for each family it uses. Only UDP and TCP to port 53
+are translated, matching what pasta maps on the tested versions; pasta also
+maps port 853 on some versions, and those flows stay `wine-unknown`. Without
+`--dns-forward`, pasta maps its `--map-host-loopback` or default gateway
+address, whose host nameserver no command line names, and DNS in such sandboxes
+stays unknown. Only port 53 sent to a `--dns-forward` address gets a
+translation entry: other traffic to the `--map-host-loopback` address is
+rewritten by pasta to loopback (`127.0.0.1` / `::1`) without one, so those
+flows stay `wine-unknown` as well. DNS sent to an address pasta does not map
+keeps its own record and joins as any other flow.
 
 A wineserver's first request tells BPF its network namespace, and from then on
 flows there are recorded, before any of its programs can have sent one. The
@@ -409,13 +413,16 @@ child's, are asserted against the events and `wine_flows`.
   next request registers the pipe afresh, leaving any socket created during that
   request `no-client` until the client writes again.
 - **DNS.** A query through pasta's `--dns-forward` address joins its client
-  only when pasta is started with `--dns-host`: the observer learns the
-  translation from the command line alone, and pasta's default host
+  only when pasta is started with `--dns-host` for that family: the observer
+  learns the translation from the command line alone, and pasta's default host
   nameserver comes from a resolv.conf that pasta's own isolation hides. DNS
   stays `wine-unknown` where pasta's forward address is its default gateway,
   which no command line names, where a pasta also maps port 853, because only
-  port 53 is translated, and where `--dns-forward` has no `--dns-host`. A rule
-  refusing `wine-unknown` must still exempt any it reaches.
+  port 53 is translated, and for a family with `--dns-forward` but no
+  `--dns-host`, even when the other family maps. Non-DNS traffic to a
+  `--map-host-loopback` address stays `wine-unknown` too, because pasta
+  rewrites it to loopback without a translation entry. A rule refusing
+  `wine-unknown` must still exempt any it reaches.
 - **32-bit names.** Under old-style WOW64, a 32-bit client is named after the first mapped file whose
   Linux name ends in `.exe`, in address order. That need not be the program's
   image, and a Linux file name is not a Windows image name, so the name can be

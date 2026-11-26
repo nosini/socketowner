@@ -233,8 +233,9 @@ int egress(struct __sk_buff *skb)
 	    !tracked_protocol(sk->protocol))
 		return 1;
 	// Sockets that existed before the programs were attached and accepted
-	// sockets have no owner. They still publish an empty owner, so that a
-	// stale entry for the same address and port is not mistaken for theirs.
+	// sockets have no owner until a send is observed with -exec-paths. Until
+	// then they publish an empty owner, so that a stale entry for the same
+	// address and port is not mistaken for theirs.
 	// MPTCP's TCP subflows are kernel sockets that also have no owner; as we
 	// can't reach the MPTCP socket's owner from here without CAP_PERFMON,
 	// they publish unknown (TGID 0) too, rather than a stale owner.

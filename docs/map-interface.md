@@ -14,7 +14,7 @@ mode 0440. Owning a pin would let a reader grant itself write access.
 
 | Pin in `maps/` | Linux map type | Key bytes | Value bytes | Availability |
 | --- | --- | ---: | ---: | --- |
-| `abi_version` | `BPF_MAP_TYPE_ARRAY` (2) | 4 | 4 | Required; one entry |
+| `abi_version` | `BPF_MAP_TYPE_ARRAY` (2) | 4 | 4 | Required; one or two entries |
 | `conn_owners` | `BPF_MAP_TYPE_LRU_HASH` (9) | 32 | 16 | Required |
 | `conn_cgroups` | `BPF_MAP_TYPE_LRU_HASH` (9) | 32 | 24 | With feature bit 0 |
 | `conn_flows` | `BPF_MAP_TYPE_LRU_HASH` (9) | 48 | 24 | With feature bit 2 |
@@ -97,10 +97,11 @@ different peers share a local address and port, and the entry then holds
 whichever of them sent last. [Flow records](#flow-records) tell them apart. Entries outlive closed sockets
 and are evicted by LRU; active flows republish after eviction. A TCP or UDP
 socket without a recorded owner, such as one from before attachment or an
-accepted socket, publishes an unknown owner (TGID 0), so a stale entry for the
-same address and port is never taken for its own. Repeated observations of the
-same TGID retain its first timestamp and UID, even if the process changes UID
-later.
+accepted socket, publishes an unknown owner (TGID 0) without `-exec-paths` and
+before its first send, so a stale entry for the same address and port is never
+taken for its own. With `-exec-paths`, `lsm/socket_sendmsg` records the sending
+process as the owner on the first send. Repeated observations of the same TGID
+retain its first timestamp and UID, even if the process changes UID later.
 
 A kernel-generated packet, such as a reset or acknowledgement sent from the
 kernel's control socket rather than by a userspace socket, changes nothing: it
@@ -268,15 +269,16 @@ an accessible file in the reader's namespace.
 
 ## Wine pins
 
-An optional Wine observer publishes three more pins in the same `maps/`
-directory: `wine_abi`, `wine_heartbeat` and `wine_flows`. They have their own
-version, currently 2, and come and go with the observer rather than with this
-loader; their presence does not change ABI v1 records. `wine_flows` is keyed by
-the connection key above and is the publication point for the trio. It is
-written by BPF from raw client memory without validation, so every reader must
-validate an image before using it as a name. See
-[the Wine observer](../wine/README.md) for their layouts, statuses, heartbeat
-rule and validation.
+An optional Wine observer publishes four more pins in the same `maps/`
+directory: `wine_abi`, `wine_heartbeat`, `wine_peer_flows` and `wine_flows`.
+They have their own version, currently 2, and come and go with the observer
+rather than with this loader; their presence does not change ABI v1 records.
+`wine_abi` key 1 advertises `wine_peer_flows` with feature bit 0; that map is
+keyed by the flow key above. `wine_flows` is keyed by the connection key above
+and is pinned last as the publication point. It is written by BPF from raw
+client memory without validation, so every reader must validate an image before
+using it as a name. See [the Wine observer](../wine/README.md) for their
+layouts, statuses, heartbeat rule and validation.
 
 ## Evolution
 

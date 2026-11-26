@@ -40,6 +40,7 @@ const (
 	helperListener = "WINE_HELPER_LISTENER"
 	helperUDP      = "WINE_HELPER_UDP"
 	helperFork     = "WINE_HELPER_FORK"
+	helperServer   = "WINE_HELPER_SERVER_NAME"
 	helperWindows  = 4242
 	helperImage    = `C:\games\alpha.exe`
 	// arch_prctl's GS-base setter (0x1001), the call a Wine client's loader
@@ -118,12 +119,16 @@ func blockUntilKilled() {
 	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
-// serverHelper imitates wineserver far enough to attribute a socket: it is
-// named wineserver, reads the request FIFO, and after the client's request
+// serverHelper imitates wineserver far enough to attribute a socket: it takes
+// a wineserver name, reads the request FIFO, and after the client's request
 // creates a socket, as wineserver does for a client's connections.
 func serverHelper() error {
-	name := append([]byte("wineserver"), 0)
-	if err := unix.Prctl(unix.PR_SET_NAME, uintptr(unsafe.Pointer(&name[0])), 0, 0, 0); err != nil {
+	name := os.Getenv(helperServer)
+	if name == "" {
+		name = "wineserver"
+	}
+	comm := append([]byte(name), 0)
+	if err := unix.Prctl(unix.PR_SET_NAME, uintptr(unsafe.Pointer(&comm[0])), 0, 0, 0); err != nil {
 		return err
 	}
 	fifo, err := unix.Open(os.Getenv(helperFIFO), unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
@@ -499,79 +504,83 @@ func TestClientCreatedSockets(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root to load the observer")
 	}
-	tcp, udp := listenLocal(t)
-	fifo := filepath.Join(t.TempDir(), "request")
-	if err := unix.Mkfifo(fifo, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	log, flows := startObserver(t)
-	env := map[string]string{helperFIFO: fifo, helperListener: tcp, helperUDP: udp}
-	server := startHelper(t, "server", env)
-	server.await(t, "read")
-	client := startHelper(t, "client", env)
-	client.await(t, "wrote")
-	if _, err := server.stdin.Write([]byte("go")); err != nil {
-		t.Fatal(err)
-	}
-	serverPID := uint32(server.process.Process.Pid)
-	clientPID := uint32(client.process.Process.Pid)
-	serverSocket := server.await(t, "socket")
-	clientTCP := client.await(t, "tcp")
-	clientUDP := client.await(t, "udp")
-
-	known := func(e Event) bool {
-		return e.Type == "create" && e.Status == "known" && e.WindowsName == "alpha.exe" &&
-			e.WindowsPID == helperWindows && e.ClientTGID == clientPID && e.ServerTGID == serverPID
-	}
-	waitForEvents(t, log, func(events []Event) error {
-		creators := map[string]int{}
-		for _, e := range events {
-			if known(e) {
-				creators[e.Creator]++
+	for _, serverName := range []string{"wineserver", "wineserver64", "wineserver32", "wineserver-deve"} {
+		t.Run(serverName, func(t *testing.T) {
+			tcp, udp := listenLocal(t)
+			fifo := filepath.Join(t.TempDir(), "request")
+			if err := unix.Mkfifo(fifo, 0o600); err != nil {
+				t.Fatal(err)
 			}
-		}
-		if creators["wineserver"] < 1 {
-			return errors.New("no wineserver-created socket")
-		}
-		if creators["client"] < 2 {
-			return fmt.Errorf("client created %d of 2 sockets", creators["client"])
-		}
-		return nil
-	})
-	for _, e := range log.snapshot() {
-		if !known(e) {
-			continue
-		}
-		// The actor names who created each socket.
-		expected := serverPID
-		if e.Creator == "client" {
-			expected = clientPID
-		}
-		if e.ActorTGID != expected {
-			t.Fatalf("creator %s named actor %d, want %d", e.Creator, e.ActorTGID, expected)
-		}
-	}
-	host, err := hostNetNS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, probe := range []struct {
-		port     int
-		protocol uint8
-	}{
-		{serverSocket.Port, unix.IPPROTO_TCP},
-		{clientTCP.Port, unix.IPPROTO_TCP},
-		{clientUDP.Port, unix.IPPROTO_UDP},
-	} {
-		record := flowRecord(t, flows, host, probe.port, probe.protocol)
-		if record.Status != 1 || record.WindowsPID != helperWindows ||
-			record.ServerTGID != serverPID || record.ClientTGID != clientPID {
-			t.Fatalf("flow record for port %d: %+v", probe.port, record)
-		}
-		image, name, err := windowsImage(record.Image[:], record.ImageBytes)
-		if err != nil || image != helperImage || name != "alpha.exe" {
-			t.Fatalf("image %q %q %v", image, name, err)
-		}
+			log, flows := startObserver(t)
+			env := map[string]string{helperFIFO: fifo, helperListener: tcp, helperUDP: udp, helperServer: serverName}
+			server := startHelper(t, "server", env)
+			server.await(t, "read")
+			client := startHelper(t, "client", env)
+			client.await(t, "wrote")
+			if _, err := server.stdin.Write([]byte("go")); err != nil {
+				t.Fatal(err)
+			}
+			serverPID := uint32(server.process.Process.Pid)
+			clientPID := uint32(client.process.Process.Pid)
+			serverSocket := server.await(t, "socket")
+			clientTCP := client.await(t, "tcp")
+			clientUDP := client.await(t, "udp")
+
+			known := func(e Event) bool {
+				return e.Type == "create" && e.Status == "known" && e.WindowsName == "alpha.exe" &&
+					e.WindowsPID == helperWindows && e.ClientTGID == clientPID && e.ServerTGID == serverPID
+			}
+			waitForEvents(t, log, func(events []Event) error {
+				creators := map[string]int{}
+				for _, e := range events {
+					if known(e) {
+						creators[e.Creator]++
+					}
+				}
+				if creators["wineserver"] < 1 {
+					return errors.New("no wineserver-created socket")
+				}
+				if creators["client"] < 2 {
+					return fmt.Errorf("client created %d of 2 sockets", creators["client"])
+				}
+				return nil
+			})
+			for _, e := range log.snapshot() {
+				if !known(e) {
+					continue
+				}
+				// The actor names who created each socket.
+				expected := serverPID
+				if e.Creator == "client" {
+					expected = clientPID
+				}
+				if e.ActorTGID != expected {
+					t.Fatalf("creator %s named actor %d, want %d", e.Creator, e.ActorTGID, expected)
+				}
+			}
+			host, err := hostNetNS()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, probe := range []struct {
+				port     int
+				protocol uint8
+			}{
+				{serverSocket.Port, unix.IPPROTO_TCP},
+				{clientTCP.Port, unix.IPPROTO_TCP},
+				{clientUDP.Port, unix.IPPROTO_UDP},
+			} {
+				record := flowRecord(t, flows, host, probe.port, probe.protocol)
+				if record.Status != 1 || record.WindowsPID != helperWindows ||
+					record.ServerTGID != serverPID || record.ClientTGID != clientPID {
+					t.Fatalf("flow record for port %d: %+v", probe.port, record)
+				}
+				image, name, err := windowsImage(record.Image[:], record.ImageBytes)
+				if err != nil || image != helperImage || name != "alpha.exe" {
+					t.Fatalf("image %q %q %v", image, name, err)
+				}
+			}
+		})
 	}
 }
 

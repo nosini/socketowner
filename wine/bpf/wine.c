@@ -72,7 +72,10 @@ struct task_struct {
 	__u64 start_boottime;
 } __attribute__((preserve_access_index));
 struct sock_common { unsigned short skc_num; } __attribute__((preserve_access_index));
-struct sock { struct sock_common __sk_common; } __attribute__((preserve_access_index));
+struct sock {
+	struct sock_common __sk_common;
+	__u16 sk_protocol;
+} __attribute__((preserve_access_index));
 struct socket { short type; struct sock *sk; } __attribute__((preserve_access_index));
 struct sockaddr { __u16 family, port; };
 struct address {
@@ -123,9 +126,9 @@ struct storage {
 	// Creator of this socket: CREATED_SERVER or CREATED_CLIENT. A pasta
 	// socket has none, so relay events leave the field empty.
 	__u32 sends, creator;
-	// Used only in relay_flows, whose values are copies of this record. A
-	// TCP record is stamped in its source before the copy, so it is never
-	// visible without them.
+	// Used only in relay_flows, whose values are copies of this record.
+	// TCP and UDP records are stamped in their source before insertion, so
+	// no copy is visible without them.
 	__u64 seen_ns;
 	__u32 count, ambiguous;
 };
@@ -281,7 +284,7 @@ struct {
 	__type(value, struct relay_head);
 } relay_heads SEC(".maps");
 // DNS translations of registered pastas, keyed by the forward address as the
-// sandbox sees it. Internal: wine_flows, the only pinned map, is unchanged.
+// sandbox sees it. Internal: the public Wine routing maps are unchanged.
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 256);
@@ -322,8 +325,13 @@ static __always_inline int is_server(void)
 {
 	char c[16] = {};
 	bpf_get_current_comm(c, sizeof(c));
-	return c[0] == 'w' && c[1] == 'i' && c[2] == 'n' && c[3] == 'e' && c[4] == 's' &&
-	       c[5] == 'e' && c[6] == 'r' && c[7] == 'v' && c[8] == 'e' && c[9] == 'r' && !c[10];
+	if (c[0] != 'w' || c[1] != 'i' || c[2] != 'n' || c[3] != 'e' || c[4] != 's' ||
+	    c[5] != 'e' || c[6] != 'r' || c[7] != 'v' || c[8] != 'e' || c[9] != 'r')
+		return 0;
+	// Accept wineserver64, wineserver32, and distribution binaries such as
+	// wineserver-development, whose task comm is truncated at 15 bytes.
+	return !c[10] || (c[10] == '6' && c[11] == '4' && !c[12]) ||
+	       (c[10] == '3' && c[11] == '2' && !c[12]) || c[10] == '-';
 }
 
 static __always_inline void lost_event(void)
@@ -410,7 +418,7 @@ static __always_inline int mapped_image(struct task_struct *task, struct client 
 		length = f->f_path.dentry->d_name.len;
 		name = f->f_path.dentry->d_name.name;
 		if (length < 5 || length > IMAGE_BYTES || bpf_probe_read_kernel(&tail, 4, name + length - 4) ||
-		    (tail | 0x20202020) != 0x6578652e)
+		    (tail | 0x20202000) != 0x6578652e)
 			continue;
 		if (bpf_probe_read_kernel(c->image, length, name))
 			continue;
@@ -452,9 +460,16 @@ static __always_inline void read_client(struct task_struct *task, struct client 
 		if (!teb || read_user_mem(&self, 8, (void *)(teb + 0x30), sleepable) || self != teb ||
 		    read_user_mem(&peb, 8, (void *)(teb + 0x60), sleepable) || !peb)
 			return;
-		if (!read_user_mem(&id, 8, (void *)(teb + 0x40), sleepable) && id && id <= 0xffffffff)
-			c->windows_pid = id;
 		c->peb = peb;
+	}
+	// The Windows PID is retried independently of the PEB, in case its read
+	// faulted or returned zero before ProcessParameters was ready.
+	if (!c->windows_pid && teb) {
+		if (self != teb)
+			read_user_mem(&self, 8, (void *)(teb + 0x30), sleepable);
+		if (self == teb && !read_user_mem(&id, 8, (void *)(teb + 0x40), sleepable) &&
+		    id && id <= 0xffffffff)
+			c->windows_pid = id;
 	}
 	peb = c->peb;
 	if (read_user_mem(&parameters, 8, (void *)(peb + 0x20), sleepable) || !parameters ||
@@ -815,22 +830,37 @@ static __always_inline __u32 relay_consume(struct relay_key *k, struct storage *
 // Each pasta socket joins at most one inner flow. Connect runs in pasta's only
 // socket thread and precedes the first host packet.
 static __always_inline void relay_connect(struct task_struct *task, struct pasta_target *t,
-					  struct socket *socket, struct sock *sk, struct sockaddr *addr)
+					  struct socket *socket, struct sock *sk, struct sockaddr *addr,
+					  int len)
 {
 	struct relay_key k = {};
 	struct address a = {};
 	struct storage *s, *e;
 	__u64 tgid = bpf_get_current_pid_tgid() >> 32;
 	__u32 status = NO_INNER_FLOW, protocol;
-	if (socket->type != 1 && socket->type != 2)
+	if (socket->type == SOCK_STREAM) {
+		if (sk->sk_protocol && sk->sk_protocol != 6)
+			return;
+		protocol = 6;
+	} else if (socket->type == SOCK_DGRAM) {
+		if (sk->sk_protocol && sk->sk_protocol != 17)
+			return;
+		protocol = 17;
+	} else {
 		return;
-	protocol = socket->type == 1 ? 6 : 17;
-	if (bpf_probe_read_kernel(&a, sizeof(a), addr))
+	}
+	if (len < 16)
+		return;
+	if (bpf_probe_read_kernel(&a.family, sizeof(a.family), &addr->family))
 		return;
 	if (a.family == 2) {
+		if (bpf_probe_read_kernel(&a, 8, addr))
+			return;
 		k.destination[10] = k.destination[11] = 0xff;
 		__builtin_memcpy(&k.destination[12], &a.v4_or_flow, 4);
 	} else if (a.family == 10) {
+		if (len < 24 || bpf_probe_read_kernel(&a, sizeof(a), addr))
+			return;
 		__builtin_memcpy(k.destination, a.v6, 16);
 	} else {
 		return;
@@ -844,8 +874,11 @@ static __always_inline void relay_connect(struct task_struct *task, struct pasta
 	if (protocol == 17) {
 		k.source_port = sk->__sk_common.skc_num;
 		e = bpf_map_lookup_elem(&relay_flows, &k);
-		if (e)
-			status = relay_status(e, s);
+		if (e) {
+			if (!relay_expired(bpf_ktime_get_boot_ns(), READ_ONCE(e->seen_ns)))
+				status = relay_status(e, s);
+			bpf_map_delete_elem(&relay_flows, &k);
+		}
 	} else {
 		status = relay_consume(&k, s);
 	}
@@ -880,7 +913,7 @@ int BPF_PROG(wine_connect, struct socket *socket, struct sockaddr *addr, int len
 	task = bpf_get_current_task_btf();
 	t = bpf_task_storage_get(&pasta_targets, task->group_leader, 0, 0);
 	if (t && t->active) {
-		relay_connect(task, t, socket, sk, addr);
+		relay_connect(task, t, socket, sk, addr, len);
 		return 0;
 	}
 	if (!(s = bpf_sk_storage_get(&wine_sockets, sk, 0, 0)) || !s->ready)
@@ -1046,8 +1079,13 @@ static __always_inline void note_inner_flow(struct flow *f, struct storage *s)
 		// socket on the port replaces its predecessor's record.
 		k.source_port = f->source_port;
 		p = bpf_map_lookup_elem(&relay_flows, &k);
-		if (p && (s ? p->owner.socket_id == s->owner.socket_id : !p->ready))
+		if (p && (s ? p->owner.socket_id == s->owner.socket_id : !p->ready)) {
+			p->seen_ns = now;
 			return;
+		}
+		value->seen_ns = now;
+		value->count = 1;
+		value->ambiguous = 0;
 		bpf_map_update_elem(&relay_flows, &k, value, BPF_ANY);
 		return;
 	}
