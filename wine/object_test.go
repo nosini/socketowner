@@ -25,6 +25,7 @@ func TestEmbeddedObjectLayout(t *testing.T) {
 		"wine_peer_flows": {ebpf.LRUHash, binary.Size(rawOwner{})},
 		"pasta_targets":   {ebpf.TaskStorage, binary.Size(pastaTarget{})},
 		"dns_forwards":    {ebpf.LRUHash, binary.Size(dnsForward{})},
+		"relay_heads":     {ebpf.LRUHash, 8},
 	} {
 		m := spec.Maps[name]
 		if m == nil || m.Type != want.typ || int(m.ValueSize) != want.size {
@@ -33,6 +34,10 @@ func TestEmbeddedObjectLayout(t *testing.T) {
 	}
 	if spec.Maps["wine_flows"].KeySize != 32 || spec.Maps["wine_peer_flows"].KeySize != 48 {
 		t.Fatal("unexpected routing map key size")
+	}
+	// Relay records and their heads share a key with a TCP generation.
+	if spec.Maps["relay_flows"].KeySize != 40 || spec.Maps["relay_heads"].KeySize != 40 {
+		t.Fatal("unexpected relay key size")
 	}
 	if binary.Size(rawEvent{}) != 1152 || binary.Size(rawOwner{}) != 1088 {
 		t.Fatal("unexpected userspace structure layout")

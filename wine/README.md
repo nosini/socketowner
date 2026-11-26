@@ -284,6 +284,16 @@ an owner the result is the same whichever connect comes first. If not, all of
 them are ambiguous and stay unknown: waiting flows are never paired by arrival
 order. Records older than two seconds are ignored.
 
+A shared TCP record counts its waiting flows: each SYN adds one and each of
+pasta's connects takes one. SYNs and connects on other CPUs change it at the
+same time, so every change is a compare-and-swap, and a record is never
+replaced or deleted under another CPU's update. `relay_heads` names each
+destination's current record by a generation that is never reused. The connect
+that takes the last flow, or the CPU that finds the record expired, retires it
+by marking it dead, and only that CPU deletes it; a SYN that finds no live record
+publishes a new generation, already holding its own flow, and a SYN that loses
+that race joins the winner's.
+
 pasta's `--dns-forward` translation rewrites one destination: a query sent to
 the forward address leaves through a socket connected to the host's resolver
 instead, so the inner record is keyed by that destination, which keeps the join
@@ -404,19 +414,16 @@ child's, are asserted against the events and `wine_flows`.
   wrong. No path is available.
 - **UDP reuse.** A new inner socket reusing a live UDP 4-tuple inherits pasta's
   existing flow, and with it the previous owner until that flow expires.
-- **TCP record deletion races, which can misname a flow.** A TCP record is
-  deleted by its key: by pasta's connect when its last waiting flow joins, and
-  by a SYN that finds it expired. Another CPU recording a SYN on the record at
-  that moment loses its update: its flow finds no record and is `wine-unknown`,
-  or, if a SYN from another program creates a new record first, it is named
-  after that program. Two SYNs that find the same expired record can also both
-  delete it, the second removing the record the first has just created. Under
-  load with several programs sharing one destination, up to 5 of 44,800 TCP
-  flows (2 of 25,600 in a later run) were named after the wrong program, and
-  most of the rest were ambiguous and `wine-unknown`; with separate
-  destinations a few flows in tens of thousands were unknown and none was
-  misnamed. Do not rely on a deny rule for a program whose sandbox runs other
-  programs connecting to the same destinations at the same time.
+- **Shared TCP destinations.** Flows from different programs waiting for one
+  destination at the same time are ambiguous and `wine-unknown`. Under load with
+  eight programs sharing one destination, 66 to 78% of TCP flows were; in four
+  such runs of 25,600 TCP flows each, none was named after the wrong program,
+  and with separate destinations none was unknown. A record evicted while its
+  flows wait, which takes 8,192 destinations waiting at once, can still leave a
+  flow to take another program's record. A SYN that loses eight swaps in a row
+  to other CPUs is not recorded and marks the current record ambiguous, so that
+  it names neither flow. Where programs share destinations, a rule refusing a
+  program should refuse `wine-unknown` as well.
 - **Shared source ports.** Linux lets sockets with different peers share a local
   address and port. When an unlabelled socket sends from the address and port of
   a live pasta socket, it removes that socket's `wine_flows` record by design.

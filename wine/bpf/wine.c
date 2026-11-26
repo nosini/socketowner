@@ -45,6 +45,13 @@
 #define TS_COMPAT 0x0002
 // pasta handles a SYN as soon as it reads the TAP; older records are leftovers.
 #define RELAY_TTL_NS 2000000000ULL
+// A TCP relay record's count once it is retired: its last waiting flow was
+// consumed, or it expired. Joining one fails, and only the CPU whose swap set
+// it deletes the record.
+#define RELAY_DEAD 0xffffffffU
+// Swaps lost to other CPUs before a SYN or connect gives up on a record.
+#define RELAY_TRIES 8
+#define READ_ONCE(x) (*(volatile typeof(x) *)&(x))
 
 struct inode { unsigned short i_mode; unsigned long i_ino; } __attribute__((preserve_access_index));
 struct qstr { const unsigned char *name; unsigned int len; } __attribute__((preserve_access_index));
@@ -143,12 +150,18 @@ struct conn_key {
 };
 // TCP has no source port here: pasta's replacement socket does not know the
 // inner one. Everything waiting for one destination shares a record, and
-// mixed owners make it ambiguous rather than a guess by arrival order.
+// mixed owners make it ambiguous rather than a guess by arrival order. A TCP
+// record also has a generation, which relay_heads names; UDP records and
+// relay_heads keys have none.
 struct relay_key {
 	__u64 netns;
 	__u8 destination[16];
 	__u16 destination_port, source_port;
 	__u8 protocol, pad[3];
+	__u64 generation;
+};
+struct relay_head {
+	__u64 generation;
 };
 struct flow {
 	__u64 netns;
@@ -252,6 +265,17 @@ struct {
 	__type(key, struct relay_key);
 	__type(value, struct storage);
 } relay_flows SEC(".maps");
+// The generation of each destination's current TCP record, which SYNs join and
+// pasta's connects consume. A record is deleted only by the CPU that retired
+// it, and its generation, from the socket ID sequence, is never used again, so
+// no CPU can delete a record another is still updating or create one in its
+// place: a SYN that can't join the current record publishes a new generation.
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct relay_key);
+	__type(value, struct relay_head);
+} relay_heads SEC(".maps");
 // DNS translations of registered pastas, keyed by the forward address as the
 // sandbox sees it. Internal: wine_flows, the only pinned map, is unchanged.
 struct {
@@ -619,6 +643,73 @@ static __always_inline __u64 next_socket_id(void)
 	return seq ? __sync_fetch_and_add(seq, 1) + 1 : 0;
 }
 
+// A record stamped after now was read is fresh, not expired by the difference
+// wrapping around.
+static __always_inline int relay_expired(__u64 now, __u64 seen)
+{
+	return now > seen && now - seen > RELAY_TTL_NS;
+}
+
+// Retires a TCP record seen with count c. It fails if the count changed, as a
+// joining SYN changes it after refreshing the time. k names the record.
+static __always_inline int relay_retire(struct relay_key *k, struct storage *p, __u32 c)
+{
+	if (__sync_val_compare_and_swap(&p->count, c, RELAY_DEAD) != c)
+		return 0;
+	bpf_map_delete_elem(&relay_flows, k);
+	return 1;
+}
+
+// The identity a record gives pasta's socket, copied into s, or why it gives
+// none.
+static __always_inline __u32 relay_status(struct storage *e, struct storage *s)
+{
+	if (e->ambiguous)
+		return AMBIGUOUS_RELAY;
+	if (!e->ready)
+		return NOT_WINE;
+	if (bpf_probe_read_kernel(&s->owner, sizeof(s->owner), &e->owner))
+		return NO_INNER_FLOW;
+	return 0;
+}
+
+// Consumes one waiting flow of the current TCP record for k, whose generation
+// is set here, and returns its status. The connect serves a flow whose SYN was
+// recorded in full before it reached pasta, so a SYN still being recorded can
+// only add an ambiguity this flow does not need.
+static __always_inline __u32 relay_consume(struct relay_key *k, struct storage *s)
+{
+	struct relay_head *head = bpf_map_lookup_elem(&relay_heads, k);
+	struct storage *e;
+	__u32 status, c;
+	int i;
+	if (!head)
+		return NO_INNER_FLOW;
+	k->generation = READ_ONCE(head->generation);
+	if (!k->generation)
+		return NO_INNER_FLOW;
+	e = bpf_map_lookup_elem(&relay_flows, k);
+	if (!e)
+		return NO_INNER_FLOW;
+	for (i = 0; i < RELAY_TRIES; i++) {
+		c = READ_ONCE(e->count);
+		if (c == RELAY_DEAD || !c)
+			return NO_INNER_FLOW;
+		if (relay_expired(bpf_ktime_get_boot_ns(), READ_ONCE(e->seen_ns))) {
+			if (relay_retire(k, e, c))
+				return NO_INNER_FLOW;
+			continue;
+		}
+		status = relay_status(e, s);
+		if (__sync_val_compare_and_swap(&e->count, c, c == 1 ? RELAY_DEAD : c - 1) == c) {
+			if (c == 1)
+				bpf_map_delete_elem(&relay_flows, k);
+			return status;
+		}
+	}
+	return NO_INNER_FLOW;
+}
+
 // Each pasta socket joins at most one inner flow. Connect runs in pasta's only
 // socket thread and precedes the first host packet.
 static __always_inline void relay_connect(struct task_struct *task, struct pasta_target *t,
@@ -629,7 +720,6 @@ static __always_inline void relay_connect(struct task_struct *task, struct pasta
 	struct storage *s, *e;
 	__u64 tgid = bpf_get_current_pid_tgid() >> 32;
 	__u32 status = NO_INNER_FLOW, protocol;
-	int fresh;
 	if (socket->type != 1 && socket->type != 2)
 		return;
 	protocol = socket->type == 1 ? 6 : 17;
@@ -649,26 +739,13 @@ static __always_inline void relay_connect(struct task_struct *task, struct pasta
 	k.netns = t->netns;
 	k.destination_port = bpf_ntohs(a.port);
 	k.protocol = protocol;
-	if (protocol == 17)
+	if (protocol == 17) {
 		k.source_port = sk->__sk_common.skc_num;
-	e = bpf_map_lookup_elem(&relay_flows, &k);
-	if (e) {
-		__u64 now = bpf_ktime_get_boot_ns(), seen = e->seen_ns;
-		// A SYN recorded since the clock was read leaves seen later than
-		// now: the record is fresh, not expired by the difference wrapping.
-		fresh = protocol == 17 || now <= seen || now - seen <= RELAY_TTL_NS;
-		if (!fresh)
-			status = NO_INNER_FLOW;
-		else if (e->ambiguous)
-			status = AMBIGUOUS_RELAY;
-		else if (!e->ready)
-			status = NOT_WINE;
-		else if (bpf_probe_read_kernel(&s->owner, sizeof(s->owner), &e->owner))
-			status = NO_INNER_FLOW;
-		else
-			status = 0;
-		if (protocol == 6 && (!fresh || __sync_fetch_and_add(&e->count, -1) <= 1))
-			bpf_map_delete_elem(&relay_flows, &k);
+		e = bpf_map_lookup_elem(&relay_flows, &k);
+		if (e)
+			status = relay_status(e, s);
+	} else {
+		status = relay_consume(&k, s);
 	}
 	if (status) {
 		__builtin_memset(&s->owner, 0, sizeof(s->owner));
@@ -810,14 +887,37 @@ static __always_inline int same_owner(struct storage *a, struct storage *b)
 	       a->owner.client_start_ns == b->owner.client_start_ns;
 }
 
+// Joins a SYN to a TCP record. The time is refreshed before the count, so a
+// CPU that read the record as expired fails to retire it once this SYN is
+// counted. Returns 1 when joined, 0 when the record is retired and a new one
+// is needed, and -1 when another CPU changed it first.
+static __always_inline int relay_join(struct relay_key *k, struct storage *p, struct storage *s, __u64 now)
+{
+	__u32 c = READ_ONCE(p->count);
+	if (c == RELAY_DEAD || !c)
+		return 0;
+	if (relay_expired(now, READ_ONCE(p->seen_ns)))
+		return relay_retire(k, p, c) ? 0 : -1;
+	p->seen_ns = now;
+	if (__sync_val_compare_and_swap(&p->count, c, c + 1) != c)
+		return -1;
+	// Counted before marked: a connect in between serves another flow,
+	// recorded in full, which this SYN's owner does not concern.
+	if (!same_owner(p, s))
+		p->ambiguous = 1;
+	return 1;
+}
+
 // Runs before the packet can reach pasta. Unlabelled flows are recorded too: a
 // native program's SYN must not let pasta consume a Windows program's record.
 static __always_inline void note_inner_flow(struct flow *f, struct storage *s)
 {
 	struct relay_key k = {};
+	struct relay_head *head, none = {};
 	struct storage *p, *value;
-	__u64 now = bpf_ktime_get_boot_ns();
+	__u64 now = bpf_ktime_get_boot_ns(), generation;
 	__u32 zero = 0;
+	int i, joined;
 	value = s ? s : bpf_map_lookup_elem(&unlabelled, &zero);
 	if (!value)
 		return;
@@ -851,36 +951,48 @@ static __always_inline void note_inner_flow(struct flow *f, struct storage *s)
 	}
 	if ((f->tcp_flags & 0x12) != 0x02)
 		return;
-	p = bpf_map_lookup_elem(&relay_flows, &k);
-	// Another CPU can stamp the record after this one read the clock; such a
-	// record is fresh, not expired by the difference wrapping around.
-	if (p && now > p->seen_ns && now - p->seen_ns > RELAY_TTL_NS) {
+	head = bpf_map_lookup_elem(&relay_heads, &k);
+	if (!head) {
+		bpf_map_update_elem(&relay_heads, &k, &none, BPF_NOEXIST);
+		head = bpf_map_lookup_elem(&relay_heads, &k);
+		if (!head)
+			return;
+	}
+	// A new record is published with its time and count already set, so no
+	// CPU ever sees it expired or without this SYN. The fields are the
+	// source's own, not its owner's, and any concurrent writer stores the
+	// same count and a recent time.
+	value->seen_ns = now;
+	value->count = 1;
+	value->ambiguous = 0;
+	for (i = 0; i < RELAY_TRIES; i++) {
+		generation = READ_ONCE(head->generation);
+		k.generation = generation;
+		p = generation ? bpf_map_lookup_elem(&relay_flows, &k) : 0;
+		if (p) {
+			joined = relay_join(&k, p, s, now);
+			if (joined > 0)
+				return;
+			if (joined < 0)
+				continue;
+		}
+		// No live record: publish a new generation. Its key is unique, so
+		// the insert creates it, and only the CPU whose swap names it in
+		// the head has its SYN recorded there; the others remove theirs,
+		// which no CPU could find, and join the winner's.
+		k.generation = next_socket_id();
+		if (!k.generation || bpf_map_update_elem(&relay_flows, &k, value, BPF_NOEXIST))
+			break;
+		if (__sync_val_compare_and_swap(&head->generation, generation, k.generation) == generation)
+			return;
 		bpf_map_delete_elem(&relay_flows, &k);
-		p = 0;
 	}
-	if (!p) {
-		// Publish the record with its time and count already set. Stamped
-		// after the insert, it was visible for a moment as stale with no
-		// SYN: another CPU's SYN to the destination then replaced it, or
-		// pasta's connect deleted it as expired, and this flow took that
-		// SYN's owner or none. The fields are the source's own, not its
-		// owner's, and any concurrent writer stores the same count and a
-		// recent time.
-		value->seen_ns = now;
-		value->count = 1;
-		value->ambiguous = 0;
-		// NOEXIST keeps two CPUs from replacing each other's waiting record.
-		if (!bpf_map_update_elem(&relay_flows, &k, value, BPF_NOEXIST))
-			return;
-		// Another CPU's record came first: join it.
-		p = bpf_map_lookup_elem(&relay_flows, &k);
-		if (!p)
-			return;
-	}
-	if (!same_owner(p, s))
+	// This SYN is unrecorded, and its connect would consume another flow's
+	// record: make the current one ambiguous, so that it names neither.
+	k.generation = READ_ONCE(head->generation);
+	p = k.generation ? bpf_map_lookup_elem(&relay_flows, &k) : 0;
+	if (p)
 		p->ambiguous = 1;
-	p->seen_ns = now;
-	__sync_fetch_and_add(&p->count, 1);
 }
 
 SEC("cgroup_skb/egress")
